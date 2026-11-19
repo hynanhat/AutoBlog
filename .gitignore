@@ -1,0 +1,22 @@
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# User data & sensitive account outputs (never commit!)
+*.csv
+posts.txt
+accounts.txt
+errors/
+logs/
+.env
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.zip
