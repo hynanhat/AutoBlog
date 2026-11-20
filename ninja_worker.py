@@ -4,11 +4,19 @@ import re
 import struct
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 from playwright.async_api import async_playwright, Browser, Error, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from hiragana_hook import HiraganaHook
-from ninja_hiragana import MAKE_URL, OUTPUT_DIR, TRACK_IMAGES, watch_hiragana
+from hiragana_hook import HiraganaHook, ManualHiraganaHook, OCRHiraganaHook
+from ninja_hiragana import (
+    MAKE_URL,
+    OUTPUT_DIR,
+    REFRESH_LINK,
+    TRACK_IMAGES,
+    on_make_page,
+    watch_hiragana,
+)
 
 # ==============================================================================
 # CÁC SELECTOR GIAO DIỆN NINJA.CO.JP
@@ -33,7 +41,6 @@ SELECTORS = {
 
     # Chuyển tiếp từ https://www.ninja.co.jp/home/ vào trang quản trị blog vừa tạo
     "home_url": "https://www.ninja.co.jp/home/",
-    "nav_blog_menu": 'header a:text-is("ブログ"), nav a:text-is("ブログ"), a:text-is("ブログ")',
 
     # Bước 3: Trang quản trị blog (/hoge/list.html) -> Soạn thảo (/hoge/NewEntry/)
     "write_blog_link": 'a:has-text("ブログを書く"), a[href*="NewEntry"]',
@@ -54,6 +61,108 @@ PUBLISHED_MESSAGE = re.compile(
     r"(?:(?:ブログ)?記事の)?(?:公開|投稿)が完了しました)[。！!]?\s*$"
 )
 NOTICE_CONTAINER = ":is([role=status], [role=alert], .success, .notice, .message, .alert, .complete, .alert-success)"
+PUBLICATION_UNCONFIRMED = "Cần kiểm tra xuất bản"
+PUBLIC_POST_FOUND = "Đã thấy bài công khai"
+MANUAL_REVIEW_SECONDS = 60
+LOGIN_TIMEOUT_SECONDS = 20
+LOGIN_HOME_SECONDS = 10
+OVERVIEW_TIMEOUT_MS = 60_000
+MAX_OCR_ATTEMPTS = 3
+MANUAL_HIRAGANA_TIMEOUT = 60
+
+
+class PublicationUnconfirmed(RuntimeError):
+    """The editor did not provide a definitive publication outcome."""
+
+
+class NeedsManualReview(RuntimeError):
+    """Leave the current account's tabs available for the operator."""
+
+
+async def login_home_stalled(page: Page) -> bool:
+    """Wait for network idle or ten continuous seconds on the login landing page."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + LOGIN_TIMEOUT_SECONDS
+    timeout = loop.create_future()
+    timer = None
+    was_home = None
+
+    def track_location(frame):
+        nonlocal timer, was_home
+        if frame != page.main_frame or timeout.done():
+            return
+        at_home = frame.url == SELECTORS["home_url"]
+        if at_home == was_home:
+            return
+        was_home = at_home
+        if timer is not None:
+            timer.cancel()
+        when = loop.time() + LOGIN_HOME_SECONDS if at_home else deadline
+        timer = loop.call_at(when, timeout.set_result, at_home)
+
+    page.on("framenavigated", track_location)
+    track_location(page.main_frame)
+    idle = asyncio.create_task(page.wait_for_load_state("networkidle", timeout=0))
+    try:
+        done, _ = await asyncio.wait((idle, timeout), return_when=asyncio.FIRST_COMPLETED)
+        if idle in done:
+            await idle
+            return False
+        if timeout.result() and page.url == SELECTORS["home_url"]:
+            return True
+        raise NeedsManualReview("Sau 20 giây mạng vẫn hoạt động. Chưa xác nhận được kết quả đăng nhập.")
+    finally:
+        page.remove_listener("framenavigated", track_location)
+        if timer is not None:
+            timer.cancel()
+        timeout.cancel()
+        idle.cancel()
+        await asyncio.gather(idle, return_exceptions=True)
+
+
+async def public_post_matches(browser: Browser, blog_url: str, title: str, html: str) -> bool:
+    """Check the public page once in a fresh, signed-out context."""
+    if not blog_url or not title.strip():
+        return False
+    public_page = None
+    try:
+        public_page = await browser.new_page(java_script_enabled=False)
+        response = await public_page.goto(blog_url, wait_until="domcontentloaded", timeout=10000)
+        if not response or not response.ok or urlsplit(public_page.url).hostname != urlsplit(blog_url).hostname:
+            return False
+        titles = public_page.get_by_role("heading", name=title, exact=True).or_(
+            public_page.locator(".entryList > li > a.entryListTitle").and_(
+                public_page.get_by_role("link", name=title, exact=True)
+            )
+        )
+        return await titles.evaluate_all(
+            """(titles, html) => {
+                const template = document.createElement('template');
+                template.innerHTML = html;
+                template.content.querySelectorAll('style, script, noscript').forEach(el => el.remove());
+                const compact = text => text.normalize('NFC').replace(/\\s+/gu, '');
+                const expected = compact(template.content.textContent);
+                if (!expected) return false;
+                return titles.some(el => {
+                    if (el.matches('a.entryListTitle')) {
+                        const body = el.parentElement.querySelector(':scope > .entryText .entryTextMain');
+                        return !!body && compact(body.innerText) === expected;
+                    }
+                    if (compact(el.innerText).includes(expected)) return false;
+                    const article = el.closest('article, [role=article], [itemprop=blogPost], .entry, .post');
+                    return !!article && compact(article.innerText).includes(expected);
+                });
+            }""",
+            html,
+        )
+    except Error:
+        return False
+    finally:
+        if public_page is not None and not public_page.is_closed():
+            try:
+                await public_page.close()
+            except Error:
+                pass
 
 
 async def publish_post(page: Page, timeout_ms: int = 20000) -> None:
@@ -65,20 +174,21 @@ async def publish_post(page: Page, timeout_ms: int = 20000) -> None:
         ":is(.error, .errortext, .caution, .alert, .alert-danger, .alert-error, font[color=red]):visible"
     ).filter(has_text=re.compile(r"\S"), has_not_text=PUBLISHED_MESSAGE).first
     if await receipt.is_visible():
-        raise RuntimeError("Trang đã có thông báo xuất bản từ trước. Hãy kiểm tra danh sách bài trước khi gửi lại.")
+        raise PublicationUnconfirmed("Trang đã có thông báo xuất bản từ trước. Hãy kiểm tra danh sách bài trước khi gửi lại.")
 
     publish_button = page.locator(SELECTORS["publish_button"]).first
-    await publish_button.click(timeout=timeout_ms)
     try:
+        await publish_button.click(timeout=timeout_ms)
         await receipt.or_(errors).first.wait_for(state="visible", timeout=timeout_ms)
-    except PlaywrightTimeoutError as exc:
-        raise RuntimeError(
+        if await errors.is_visible():
+            raise RuntimeError(f"Lỗi Shinobi khi xuất bản: {await errors.inner_text()}")
+        if await receipt.is_visible():
+            return
+    except Error as exc:
+        raise PublicationUnconfirmed(
             "Chưa xác nhận được bài đã xuất bản. Hãy kiểm tra danh sách bài trên Shinobi trước khi thử lại."
         ) from exc
-    if await errors.is_visible():
-        raise RuntimeError(f"Lỗi Shinobi khi xuất bản: {await errors.inner_text()}")
-    if not await receipt.is_visible():
-        raise RuntimeError("Thông báo xác nhận xuất bản không còn hiển thị. Hãy kiểm tra danh sách bài.")
+    raise PublicationUnconfirmed("Thông báo xác nhận xuất bản không còn hiển thị. Hãy kiểm tra danh sách bài.")
 
 
 @dataclass
@@ -201,10 +311,10 @@ class NinjaAutomationRunner:
                 await self._human_delay(page)
 
                 await page.locator(SELECTORS["login_submit"]).first.click()
-                await page.wait_for_load_state("networkidle", timeout=20000)
+                stalled_home = await login_home_stalled(page)
 
                 if "login" in page.url.lower():
-                    raise RuntimeError("Đăng nhập thất bại (sai mật khẩu hoặc cần xác minh).")
+                    raise NeedsManualReview("Vẫn ở trang đăng nhập. Hãy xem thông báo của Shinobi trong tab.")
 
                 if self._stop_requested:
                     self.on_status(idx, email, selected_domain, "ĐÃ HỦY", "")
@@ -212,8 +322,13 @@ class NinjaAutomationRunner:
 
                 # BƯỚC 2: Khởi tạo blog và chờ nhập Hiragana
                 self.on_status(idx, email, selected_domain, "Đang tạo blog...", "")
-                await self._human_delay(page)
+                if stalled_home:
+                    self.on_log(f"[{idx}] Tab đã ở /home/ 10 giây. Đang mở trang tạo blog.")
+                else:
+                    await self._human_delay(page)
                 await page.add_init_script(TRACK_IMAGES)
+                if stalled_home and page.url != SELECTORS["home_url"]:
+                    raise NeedsManualReview("Tab đã rời /home/ trước khi mở trang tạo blog.")
                 await page.goto(SELECTORS["make_url"], wait_until="domcontentloaded", timeout=30000)
                 hiragana_watcher = asyncio.create_task(self._watch_hiragana(page, idx))
                 await self._human_delay(page)
@@ -240,84 +355,9 @@ class NinjaAutomationRunner:
                         await self._human_delay(page)
 
                 self.on_status(idx, email, selected_domain, "Đang xử lý Hiragana...", "")
-
-                # 1. Tìm chính xác thẻ <img> chứa ảnh Hiragana
-                known_img = page.locator("img#authimg:visible, #authimg img:visible").first
-                xp_img = page.locator("xpath=//a[normalize-space(.)='読みにくいので画像変更']/preceding::img[1]").first
-                hiragana_img = known_img if (await known_img.count() > 0 and await known_img.is_visible()) else xp_img
-
-                image_bytes = None
-                if await hiragana_img.count() > 0:
-                    try:
-                        # Đợi ảnh tải xong hoàn toàn và có chiều cao thực tế > 30px
-                        await page.wait_for_function(
-                            "img => img && img.complete && (img.naturalHeight > 30 || img.clientHeight > 30)",
-                            arg=await hiragana_img.element_handle(),
-                            timeout=6000,
-                        )
-                    except Exception:
-                        pass
-                    await hiragana_img.scroll_into_view_if_needed()
-                    image_bytes = await hiragana_img.screenshot(type="png")
-
-                # 2. Kiểm tra kích thước ảnh: nếu bị cắt nhỏ (chiều cao <= 30px), lấy ảnh gốc từ thư mục hiragana
-                if image_bytes and len(image_bytes) > 24 and image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
-                    _w, _h = struct.unpack(">II", image_bytes[16:24])
-                    if _h <= 30:
-                        self.on_log(f"[{idx}] Ảnh chụp bị quá nhỏ ({_w}x{_h}), đang lấy ảnh chuẩn từ bộ theo dõi...")
-                        recent_imgs = sorted(OUTPUT_DIR.glob("hiragana-*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
-                        for r_img in recent_imgs[:5]:
-                            data = r_img.read_bytes()
-                            if len(data) > 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
-                                _rw, _rh = struct.unpack(">II", data[16:24])
-                                if _rh > 30:
-                                    image_bytes = data
-                                    self.on_log(f"[{idx}] Đã lấy ảnh chuẩn ({_rw}x{_rh}) từ {r_img.name}")
-                                    break
-                elif not image_bytes:
-                    recent_imgs = sorted(OUTPUT_DIR.glob("hiragana-*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
-                    if recent_imgs:
-                        image_bytes = recent_imgs[0].read_bytes()
-                        self.on_log(f"[{idx}] Lấy ảnh từ bộ theo dõi: {recent_imgs[0].name}")
-
-                hiragana_input = page.locator(SELECTORS["hiragana_input"]).first
-                if await hiragana_input.count() > 0:
-                    await hiragana_input.focus()
-
-                confirmation = asyncio.create_task(self.hiragana_hook.solve(image_bytes, idx, email))
-                try:
-                    while not confirmation.done():
-                        if self._stop_requested:
-                            self.on_status(idx, email, selected_domain, "ĐÃ HỦY", "")
-                            return
-                        if page.is_closed():
-                            raise RuntimeError("Đã đóng trang Chromium khi đang chờ nhập Hiragana.")
-                        await asyncio.wait({confirmation}, timeout=0.3)
-                    solved_text = confirmation.result()
-                finally:
-                    if not confirmation.done():
-                        confirmation.cancel()
-                        await asyncio.gather(confirmation, return_exceptions=True)
-                if solved_text is not None:
-                    self.on_log(f"[{idx}] OCR nhận diện '{solved_text}'. Tự động điền và bấm nút Tạo Blog...")
-                    await hiragana_input.fill(solved_text)
-                    await self._human_delay(page)
-                    await page.locator(SELECTORS["make_submit"]).first.click()
-                elif await hiragana_input.is_visible():
-                    self.on_status(idx, email, selected_domain, "Chờ gửi trên Chromium", "")
-                    self.on_log(
-                        f"[{idx}] Biểu mẫu Hiragana vẫn đang mở. Kiểm tra thông báo trên Chromium, "
-                        "nhập ký tự và bấm nút tạo blog (作成する)."
-                    )
-                    while await hiragana_input.is_visible():
-                        if self._stop_requested:
-                            self.on_status(idx, email, selected_domain, "ĐÃ HỦY", "")
-                            return
-                        if page.is_closed():
-                            raise RuntimeError("Đã đóng trang Chromium khi đang chờ gửi biểu mẫu.")
-                        await asyncio.sleep(0.3)
-
-                await page.wait_for_load_state("networkidle", timeout=25000)
+                blog_created = await self._process_hiragana_step(page, idx, email, selected_domain)
+                if not blog_created:
+                    raise RuntimeError("Chưa hoàn tất bước xác thực Hiragana để tạo blog.")
 
                 if self._stop_requested:
                     self.on_status(idx, email, selected_domain, "ĐÃ HỦY", "")
@@ -326,7 +366,10 @@ class NinjaAutomationRunner:
                 # BƯỚC 2.5: Từ trang /home/ bấm vào blog vừa tạo để vào trang quản trị
                 self.on_status(idx, email, selected_domain, "Đang vào trang quản trị blog...", "")
                 await self._human_delay(page)
-                page = await self._open_created_blog_dashboard(context, page)
+                try:
+                    page = await self._open_created_blog_dashboard(context, page, idx)
+                except PlaywrightTimeoutError as exc:
+                    raise NeedsManualReview("Hết thời gian chờ mở trang quản trị. Phiên chưa đến bước soạn bài.") from exc
 
                 if self._stop_requested:
                     self.on_status(idx, email, selected_domain, "ĐÃ HỦY", "")
@@ -367,13 +410,30 @@ class NinjaAutomationRunner:
                     self.on_status(idx, email, selected_domain, "ĐÃ HỦY", "")
                     return
 
-                await publish_post(page)
-
-                # BƯỚC 4: Trích xuất link blog
+                try:
+                    await publish_post(page)
+                except PublicationUnconfirmed as exc:
+                    status = PUBLICATION_UNCONFIRMED
+                    detail = f"{exc} Tiêu đề: {post_title}"
+                else:
+                    status = "DONE"
+                    detail = "Đã nhận xác nhận xuất bản."
                 blog_url = await self._extract_blog_url(page, selected_domain)
-                self.on_status(idx, email, selected_domain, "DONE", blog_url)
-                self.on_log(f"[{idx}] Thành công: {email} -> {blog_url}")
+                if status == PUBLICATION_UNCONFIRMED and await public_post_matches(browser, blog_url, post_title, post_html):
+                    status = PUBLIC_POST_FOUND
+                    detail = f"Đã đối chiếu tiêu đề và nội dung trên blog công khai: {post_title}."
+                self.on_status(idx, email, selected_domain, status, blog_url)
+                self.on_log(f"[{idx}] {detail} {blog_url}".rstrip())
 
+            except NeedsManualReview as exc:
+                if hiragana_watcher is not None:
+                    hiragana_watcher.cancel()
+                    await asyncio.gather(hiragana_watcher, return_exceptions=True)
+                self.on_log(f"[{idx}] {exc}")
+                self.on_status(idx, email, selected_domain, "Chờ kiểm tra trên Chromium", "")
+                await self._review_tabs(context, idx)
+                status = "ĐÃ HỦY" if self._stop_requested else f"LỖI: {exc}"
+                self.on_status(idx, email, selected_domain, status, "")
             except Exception as exc:
                 self.on_status(idx, email, selected_domain, f"LỖI: {exc}", "")
                 self.on_log(f"[{idx}] Lỗi ({email}): {exc}")
@@ -392,35 +452,304 @@ class NinjaAutomationRunner:
                     except Exception:
                         pass
 
-    async def _open_created_blog_dashboard(self, context, page: Page) -> Page:
+    async def _capture_hiragana_image(
+        self,
+        page: Page,
+        idx: int,
+        previous_bytes: Optional[bytes] = None,
+    ) -> Optional[bytes]:
+        """Tìm và chụp ảnh Hiragana (img#authimg), nếu ảnh quá nhỏ sẽ lấy từ bộ theo dõi."""
+        known_img = page.locator("img#authimg:visible, #authimg img:visible").first
+        xp_img = page.locator(f"xpath=//a[normalize-space(.)='{REFRESH_LINK}']/preceding::img[1]").first
+        hiragana_img = known_img if (await known_img.count() > 0 and await known_img.is_visible()) else xp_img
+
+        image_bytes = None
+        if await hiragana_img.count() > 0:
+            try:
+                await page.wait_for_function(
+                    "img => img && img.complete && (img.naturalHeight > 30 || img.clientHeight > 30)",
+                    arg=await hiragana_img.element_handle(),
+                    timeout=6000,
+                )
+            except Exception:
+                pass
+            try:
+                await hiragana_img.scroll_into_view_if_needed()
+                image_bytes = await hiragana_img.screenshot(type="png")
+            except Exception:
+                pass
+
+        if image_bytes and len(image_bytes) > 24 and image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+            _w, _h = struct.unpack(">II", image_bytes[16:24])
+            if _h <= 30:
+                self.on_log(f"[{idx}] Ảnh chụp bị quá nhỏ ({_w}x{_h}), đang lấy ảnh chuẩn từ bộ theo dõi...")
+                recent_imgs = sorted(OUTPUT_DIR.glob("hiragana-*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+                for r_img in recent_imgs[:5]:
+                    data = r_img.read_bytes()
+                    if len(data) > 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
+                        _rw, _rh = struct.unpack(">II", data[16:24])
+                        if _rh > 30 and (previous_bytes is None or data != previous_bytes):
+                            image_bytes = data
+                            self.on_log(f"[{idx}] Đã lấy ảnh chuẩn ({_rw}x{_rh}) từ {r_img.name}")
+                            break
+        elif not image_bytes:
+            recent_imgs = sorted(OUTPUT_DIR.glob("hiragana-*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for r_img in recent_imgs[:5]:
+                data = r_img.read_bytes()
+                if previous_bytes is None or data != previous_bytes:
+                    image_bytes = data
+                    self.on_log(f"[{idx}] Lấy ảnh từ bộ theo dõi: {r_img.name}")
+                    break
+
+        return image_bytes
+
+    async def _wait_for_make_submission(self, page: Page, timeout_sec: float = 15.0) -> bool:
+        """
+        Chờ phản hồi sau khi gửi biểu mẫu tạo blog:
+        - Trả về True nếu thành công (URL đã chuyển trang khỏi /home/blog/make).
+        - Trả về False nếu nhập sai Hiragana hoặc biểu mẫu có lỗi (vẫn ở make, input bị xóa hoặc hiện lỗi).
+        """
+        start_time = asyncio.get_running_loop().time()
+        deadline = start_time + timeout_sec
+
+        await asyncio.sleep(1.0)
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+
+        while asyncio.get_running_loop().time() < deadline:
+            if page.is_closed():
+                raise RuntimeError("Trang Chromium đã bị đóng.")
+
+            # Nếu URL đã chuyển khỏi /home/blog/make -> Đã tạo blog thành công
+            if not on_make_page(page):
+                return True
+
+            # Kiểm tra nếu ô input đã bị xóa rỗng sau khi web reload lỗi
+            hiragana_input = page.locator(SELECTORS["hiragana_input"]).first
+            if await hiragana_input.count() > 0:
+                val = (await hiragana_input.input_value()).strip()
+                if val == "":
+                    return False
+
+                err_loc = page.locator(
+                    ":is(.error, .errortext, .caution, .alert, .alert-danger, .alert-error, font[color=red]):visible"
+                ).first
+                if await err_loc.count() > 0 and await err_loc.is_visible():
+                    err_text = (await err_loc.inner_text()).strip()
+                    if err_text:
+                        return False
+
+            await asyncio.sleep(0.5)
+
+        return not on_make_page(page)
+
+    async def _refresh_hiragana_image(self, page: Page, idx: int) -> None:
+        """Bấm link 読みにくいので画像変更 để web đổi ảnh Hiragana mới."""
+        try:
+            refresh_link = page.locator(f"xpath=//a[normalize-space(.)='{REFRESH_LINK}']").first
+            if await refresh_link.count() > 0 and await refresh_link.is_visible():
+                self.on_log(f"[{idx}] Bấm '{REFRESH_LINK}' để đổi ảnh Hiragana mới...")
+                await refresh_link.click()
+                await page.wait_for_timeout(1000)
+        except Exception as exc:
+            self.on_log(f"[{idx}] Không thể bấm đổi ảnh: {exc}")
+
+    async def _handle_manual_hiragana(
+        self,
+        page: Page,
+        idx: int,
+        email: str,
+        selected_domain: str,
+        timeout: float = float(MANUAL_HIRAGANA_TIMEOUT),
+    ) -> bool:
+        """
+        Chờ người dùng nhập Hiragana thủ công trực tiếp trên Chromium
+        hoặc bấm xác nhận trên giao diện App, với thời gian chờ tối đa (mặc định 60 giây).
+        """
+        hiragana_input = page.locator(SELECTORS["hiragana_input"]).first
+        if await hiragana_input.count() > 0:
+            try:
+                await hiragana_input.focus()
+            except Exception:
+                pass
+
+        self.on_status(idx, email, selected_domain, f"Chờ nhập tay Hiragana ({int(timeout)}s)", "")
+        self.on_log(
+            f"[{idx}] Vui lòng nhập Hiragana trên Chromium và bấm nút tạo blog ('作成する'). "
+            f"Thời gian chờ tối đa {int(timeout)} giây..."
+        )
+
+        manual_hook = getattr(self.hiragana_hook, "fallback_hook", None) or self.hiragana_hook
+        manual_task = None
+        if isinstance(manual_hook, ManualHiraganaHook):
+            manual_task = asyncio.create_task(manual_hook.solve(None, idx, email))
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        last_reported_sec = int(timeout)
+
+        try:
+            while loop.time() < deadline:
+                if self._stop_requested:
+                    self.on_status(idx, email, selected_domain, "ĐÃ HỦY", "")
+                    return False
+                if page.is_closed():
+                    raise RuntimeError("Đã đóng trang Chromium khi đang chờ nhập Hiragana.")
+
+                # 1. Người dùng đã gửi thành công trên Chromium
+                if not on_make_page(page):
+                    self.on_log(f"[{idx}] Xác nhận tạo blog thành công qua nhập tay.")
+                    return True
+
+                # 2. Người dùng đã bấm nút xác nhận trên giao diện App
+                if manual_task and manual_task.done():
+                    await asyncio.sleep(1.0)
+                    if not on_make_page(page):
+                        self.on_log(f"[{idx}] Đã xác nhận gửi trên giao diện, tạo blog thành công.")
+                        return True
+                    if await hiragana_input.count() > 0 and await hiragana_input.is_visible():
+                        val = (await hiragana_input.input_value()).strip()
+                        if val:
+                            self.on_log(f"[{idx}] Nhận diện ký tự '{val}' đã nhập, tự động bấm Tạo Blog...")
+                            await page.locator(SELECTORS["make_submit"]).first.click()
+                            if await self._wait_for_make_submission(page):
+                                return True
+
+                remaining_sec = max(0, int(deadline - loop.time()))
+                if last_reported_sec - remaining_sec >= 10 and remaining_sec > 0:
+                    last_reported_sec = remaining_sec
+                    self.on_status(idx, email, selected_domain, f"Chờ nhập tay Hiragana ({remaining_sec}s)", "")
+
+                await asyncio.sleep(0.5)
+
+            self.on_log(f"[{idx}] Hết thời gian chờ nhập tay Hiragana ({int(timeout)}s).")
+            raise RuntimeError(f"Hết thời gian chờ nhập tay Hiragana ({int(timeout)}s).")
+        finally:
+            if manual_task and not manual_task.done():
+                manual_task.cancel()
+                await asyncio.gather(manual_task, return_exceptions=True)
+
+    async def _process_hiragana_step(
+        self,
+        page: Page,
+        idx: int,
+        email: str,
+        selected_domain: str,
+    ) -> bool:
+        """
+        Quy trình xác thực Hiragana:
+        - Nếu dùng OCR (OCRHiraganaHook), thử OCR tối đa MAX_OCR_ATTEMPTS (3) lần.
+        - Khi nhập sai, web tự đổi ảnh -> thử lại OCR với ảnh mới.
+        - Nếu sau 3 lần OCR vẫn không được -> chuyển sang nhập tay (chờ 60s).
+        """
+        use_ocr = isinstance(self.hiragana_hook, OCRHiraganaHook)
+        last_image_bytes: Optional[bytes] = None
+
+        if use_ocr:
+            for attempt in range(1, MAX_OCR_ATTEMPTS + 1):
+                if self._stop_requested:
+                    self.on_status(idx, email, selected_domain, "ĐÃ HỦY", "")
+                    return False
+                if page.is_closed():
+                    raise RuntimeError("Đã đóng trang Chromium khi đang xử lý Hiragana.")
+
+                self.on_status(idx, email, selected_domain, f"Đang giải OCR Hiragana ({attempt}/{MAX_OCR_ATTEMPTS})...", "")
+                self.on_log(f"[{idx}] Thử giải OCR Hiragana lần {attempt}/{MAX_OCR_ATTEMPTS}...")
+
+                # 1. Chụp ảnh Hiragana hiện tại
+                image_bytes = await self._capture_hiragana_image(page, idx, previous_bytes=last_image_bytes)
+                last_image_bytes = image_bytes
+
+                # 2. Gọi OCR giải ảnh
+                solved_text = await self.hiragana_hook.solve_ocr(image_bytes, idx, email)
+
+                if solved_text:
+                    self.on_log(f"[{idx}] OCR lần {attempt} nhận diện '{solved_text}'. Tự động điền và bấm nút Tạo Blog...")
+                    hiragana_input = page.locator(SELECTORS["hiragana_input"]).first
+                    await hiragana_input.fill(solved_text)
+                    await self._human_delay(page)
+                    await page.locator(SELECTORS["make_submit"]).first.click()
+
+                    # 3. Kiểm tra kết quả submit
+                    is_success = await self._wait_for_make_submission(page)
+                    if is_success:
+                        self.on_log(f"[{idx}] Tạo blog thành công ở lần thử OCR thứ {attempt}!")
+                        return True
+
+                    self.on_log(
+                        f"[{idx}] Nhập sai Hiragana (lần {attempt}/{MAX_OCR_ATTEMPTS}). "
+                        f"Web đã tự đổi ảnh mới."
+                    )
+                    await self._human_delay(page, min_sec=1.5, max_sec=2.5)
+                else:
+                    self.on_log(f"[{idx}] OCR lần {attempt}/{MAX_OCR_ATTEMPTS} không nhận diện được ảnh hợp lệ.")
+                    if attempt < MAX_OCR_ATTEMPTS:
+                        await self._refresh_hiragana_image(page, idx)
+                        await self._human_delay(page, min_sec=1.5, max_sec=2.5)
+
+            self.on_log(
+                f"[{idx}] Đã thử OCR {MAX_OCR_ATTEMPTS} lần không thành công. "
+                f"Chuyển sang nhập tay (thời gian chờ: {MANUAL_HIRAGANA_TIMEOUT}s)..."
+            )
+        else:
+            self.on_log(f"[{idx}] Chế độ nhập tay Hiragana (thời gian chờ: {MANUAL_HIRAGANA_TIMEOUT}s)...")
+
+        return await self._handle_manual_hiragana(
+            page, idx, email, selected_domain, timeout=float(MANUAL_HIRAGANA_TIMEOUT)
+        )
+
+    async def _review_tabs(self, context, idx: int):
+        if self._stop_requested or not context.pages:
+            return
+        self.on_log(f"[{idx}] Giữ tab tối đa {MANUAL_REVIEW_SECONDS} giây để kiểm tra thủ công. Đóng các tab của phiên để kết thúc sớm.")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + MANUAL_REVIEW_SECONDS
+        while context.pages and not self._stop_requested:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.25, remaining))
+
+    async def _open_created_blog_dashboard(self, context, page: Page, idx: int) -> Page:
         if "/hoge/" in page.url:
             return page
 
-        if "ninja.co.jp/home" not in page.url:
-            await page.goto(SELECTORS["home_url"], wait_until="domcontentloaded", timeout=20000)
+        if page.url.rstrip("/") != SELECTORS["home_url"].rstrip("/"):
+            await page.goto(SELECTORS["home_url"], wait_until="domcontentloaded", timeout=OVERVIEW_TIMEOUT_MS)
             await self._human_delay(page)
 
         blog_name = self.config.blog_name
         pages_before = len(context.pages)
 
-        direct_link = page.locator(f'a:text-is("{blog_name}")').last
-        clicked = False
-        if await direct_link.count() > 0 and await direct_link.is_visible():
+        direct_link = page.get_by_role("link", name=blog_name, exact=True).last
+        blog_menu = page.get_by_role("link", name="ブログ", exact=True).first
+        if page.url == SELECTORS["home_url"]:
+            ready = direct_link.or_(blog_menu).first
+            try:
+                await ready.wait_for(state="visible", timeout=OVERVIEW_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                if self._stop_requested or page.url != SELECTORS["home_url"]:
+                    raise
+                self.on_log(f"[{idx}] Trang tổng quan chưa hiện liên kết sau 60 giây. Đang tải lại một lần.")
+                # GET the overview explicitly so Chromium cannot replay a form submission.
+                await page.goto(SELECTORS["home_url"], wait_until="domcontentloaded", timeout=OVERVIEW_TIMEOUT_MS)
+                if page.url != SELECTORS["home_url"]:
+                    raise NeedsManualReview("Shinobi đã chuyển khỏi trang tổng quan sau khi tải lại.")
+                await ready.wait_for(state="visible", timeout=OVERVIEW_TIMEOUT_MS)
+        if self._stop_requested:
+            return page
+        if await direct_link.is_visible():
             await direct_link.click()
-            clicked = True
         else:
-            blog_menu = page.locator(SELECTORS["nav_blog_menu"]).first
             await blog_menu.wait_for(state="visible", timeout=15000)
             await blog_menu.click()
             await self._human_delay(page)
 
-            dropdown_link = page.locator(f'a:text-is("{blog_name}")').first
+            dropdown_link = page.get_by_role("link", name=blog_name, exact=True).first
             await dropdown_link.wait_for(state="visible", timeout=15000)
             await dropdown_link.click()
-            clicked = True
-
-        if not clicked:
-            raise RuntimeError(f"Không tìm thấy blog '{blog_name}' trên trang /home/.")
 
         await self._human_delay(page)
         if len(context.pages) > pages_before:
@@ -459,18 +788,22 @@ class NinjaAutomationRunner:
         return title, item["html"]
 
     async def _extract_blog_url(self, page: Page, selected_domain: str) -> str:
-        link_el = page.locator(SELECTORS["blog_url_link"]).first
-        if await link_el.count() > 0 and await link_el.is_visible():
-            href = await link_el.get_attribute("href")
-            if href and href.startswith("http"):
-                return href.strip()
-
-        view_link = page.locator("a:has-text('ブログを見る'), a:has-text('公開ページ')").first
-        if await view_link.count() > 0:
-            href = await view_link.get_attribute("href")
-            if href and href.startswith("http") and "admin" not in href:
-                return href.strip()
-
-        if selected_domain and selected_domain != "-":
-            return f"https://{self.config.subdomain}.{selected_domain}/"
-        return page.url
+        subdomain = self.config.subdomain.lower()
+        domain = selected_domain.lower().lstrip(".")
+        if re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
+            return f"https://{subdomain}.{domain}/"
+        # Some domain options have a numeric value. Use the public link in the editor.
+        try:
+            links = await page.locator(SELECTORS["blog_url_link"] + ", a:has-text('ブログを見る'), a:has-text('公開ページ')").evaluate_all(
+                "(links) => links.map(a => a.href)"
+            )
+        except Error:
+            return ""
+        for href in links:
+            try:
+                url = urlsplit(href)
+                if url.scheme in ("https", "http") and (url.hostname or "").startswith(subdomain + "."):
+                    return href
+            except ValueError:
+                continue
+        return ""

@@ -7,7 +7,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from hiragana_hook import ManualHiraganaHook, OCRHiraganaHook
-from ninja_worker import JobConfig, NinjaAutomationRunner
+from ninja_worker import JobConfig, NinjaAutomationRunner, PUBLIC_POST_FOUND, PUBLICATION_UNCONFIRMED
 from ocr_client import HiraganaOCRClient, OCRConfig, ensure_ocr_server_running
 from parsers import parse_gmails, parse_posts_txt, validate_mapping
 
@@ -500,41 +500,39 @@ class NinjaBlogApp(ctk.CTk):
                 title, msg = payload
                 messagebox.showerror(title, msg)
             elif kind == "finished":
-                self.runner = None
-                self.btn_start.configure(state="normal")
-                self.btn_stop.configure(state="disabled")
-
-                pending_count = sum(1 for r in self.results_rows.values() if r["status"] == "Đang chờ")
-                error_count = sum(
-                    1 for r in self.results_rows.values()
-                    if r["status"].startswith("LỖI") or r["status"] == "ĐÃ HỦY" or r["status"] == "Phiên chạy bị gián đoạn"
-                )
-                success_count = sum(1 for r in self.results_rows.values() if r["status"] == "DONE")
-
-                if payload is not None:
-                    for row in self.results_rows.values():
-                        if row["status"] == "Đang chờ":
-                            row["status"] = "Phiên chạy bị gián đoạn"
-                            row["widgets"][1].configure(text=row["status"])
-                    messagebox.showerror("Phiên chạy bị gián đoạn", payload)
-                elif pending_count > 0:
-                    for row in self.results_rows.values():
-                        if row["status"] == "Đang chờ":
-                            row["status"] = "Chưa hoàn tất"
-                            row["widgets"][1].configure(text=row["status"])
-                    messagebox.showwarning(
-                        "Chưa hoàn tất toàn bộ",
-                        f"Kết thúc phiên chạy:\n- Thành công: {success_count}\n- Lỗi/Hủy: {error_count}\n- Chưa thực hiện: {pending_count}"
-                    )
-                else:
-                    if error_count > 0:
-                        messagebox.showwarning(
-                            "Hoàn tất có lỗi",
-                            f"Đã xử lý xong toàn bộ danh sách:\n- Thành công: {success_count}\n- Thất bại: {error_count}"
-                        )
-                    else:
-                        messagebox.showinfo("Hoàn tất", f"Đã hoàn tất thành công {success_count} blog!")
+                self._finish_job(payload)
         self.after(150, self._poll_ui_queue)
+
+    def _finish_job(self, failure: str | None):
+        self.runner = None
+        self.btn_start.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
+
+        succeeded = failed = unfinished = unconfirmed = 0
+        for row in self.results_rows.values():
+            status = row["status"]
+            if status in ("DONE", PUBLIC_POST_FOUND):
+                succeeded += 1
+            elif status == PUBLICATION_UNCONFIRMED:
+                unconfirmed += 1
+            elif status.startswith("LỖI") or status == "ĐÃ HỦY":
+                failed += 1
+            else:
+                unfinished += 1
+                row["status"] = "Phiên chạy bị gián đoạn" if failure is not None else "Chưa hoàn tất"
+                row["widgets"][1].configure(text=row["status"])
+
+        if failure is not None:
+            messagebox.showerror("Phiên chạy bị gián đoạn", failure)
+        elif unfinished or failed or unconfirmed:
+            title = "Chưa hoàn tất toàn bộ" if unfinished else "Hoàn tất có lỗi"
+            summary = f"Thành công: {succeeded}\nLỗi/Hủy: {failed}\nChưa hoàn tất: {unfinished}"
+            if unconfirmed:
+                title = PUBLICATION_UNCONFIRMED
+                summary += f"\nCần đối chiếu trên blog trước khi đăng lại: {unconfirmed}"
+            messagebox.showwarning(title, summary)
+        else:
+            messagebox.showinfo("Hoàn tất", f"Đã hoàn tất thành công {succeeded} blog!")
 
     def _stop_job(self):
         self.stop_requested = True

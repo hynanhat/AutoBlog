@@ -38,7 +38,7 @@ if not defined PY_RUNNER (
     if exist ".venv\Scripts\python.exe" (
         echo [INFO] Dang cai dat cac thu vien con thieu (uvicorn, starlette, opencv...) vao .venv...
         call .venv\Scripts\activate
-        pip install -r requirements.txt
+        pip install -r requirements-runtime.txt
         set "PY_RUNNER=.\.venv\Scripts\python.exe"
     ) else (
         set "PY_RUNNER=python"

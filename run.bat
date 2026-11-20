@@ -18,8 +18,8 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 set "PYTHON_RUNNER=.venv\Scripts\python.exe"
-echo [2/3] Dang kiem tra thu vien trong requirements.txt...
-"%PYTHON_RUNNER%" -m pip install --disable-pip-version-check -r requirements.txt
+echo [2/3] Dang kiem tra thu vien trong requirements-runtime.txt...
+"%PYTHON_RUNNER%" -m pip install --disable-pip-version-check -r requirements-runtime.txt
 if errorlevel 1 (
     echo [LOI] Khong the cai dat cac thu vien.
     goto :failed

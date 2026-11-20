@@ -77,25 +77,27 @@ class OCRHiraganaHook(HiraganaHook):
         self.timeout = timeout
         self.on_log = on_log or (lambda msg: None)
 
-    async def solve(
+    async def solve_ocr(
         self,
         image_bytes: Optional[bytes],
         account_index: int,
         email: str,
     ) -> Optional[str]:
+        """
+        Thực hiện giải OCR cho 1 ảnh đơn lẻ.
+        Trả về chuỗi Hiragana 6 ký tự nếu thành công, hoặc None nếu thất bại.
+        Không tự động chuyển sang fallback_hook để bộ điều phối (NinjaAutomationRunner)
+        có thể chủ động thử lại (retry) nhiều lần theo nghiệp vụ.
+        """
         if not image_bytes:
             self.on_log(f"[{account_index}] Không có dữ liệu ảnh Hiragana.")
-            if self.fallback_hook:
-                return await self.fallback_hook.solve(image_bytes, account_index, email)
             return None
 
         # Kiểm tra nhanh trạng thái dịch vụ OCR trước khi gửi ảnh
         healthy, health_info = self.ocr_client.check_health()
         if not healthy:
             err_msg = health_info.get("error", "Dịch vụ OCR không phản hồi")
-            self.on_log(f"[{account_index}] Dịch vụ OCR không khả dụng ({err_msg}). Chuyển sang nhập tay.")
-            if self.fallback_hook:
-                return await self.fallback_hook.solve(image_bytes, account_index, email)
+            self.on_log(f"[{account_index}] Dịch vụ OCR không khả dụng ({err_msg}).")
             return None
 
         self.on_log(f"[{account_index}] Đang gửi ảnh Hiragana sang dịch vụ OCR...")
@@ -116,10 +118,23 @@ class OCRHiraganaHook(HiraganaHook):
                     f"[{account_index}] OCR trả kết quả không đủ {self.ocr_client.config.expected_length} ký tự "
                     f"({length} ký tự: '{solved_text}')."
                 )
+                return None
         except (OCRConnectionError, OCRValidationError, OCRJobFailedError, TimeoutError, asyncio.TimeoutError) as exc:
             self.on_log(f"[{account_index}] OCR không giải được ({type(exc).__name__}): {exc}")
+            return None
         except Exception as exc:
             self.on_log(f"[{account_index}] Lỗi bất ngờ khi gọi OCR: {exc}")
+            return None
+
+    async def solve(
+        self,
+        image_bytes: Optional[bytes],
+        account_index: int,
+        email: str,
+    ) -> Optional[str]:
+        solved = await self.solve_ocr(image_bytes, account_index, email)
+        if solved is not None:
+            return solved
 
         # Dự phòng khi OCR thất bại: chuyển sang nhập tay trên trình duyệt
         if self.fallback_hook:

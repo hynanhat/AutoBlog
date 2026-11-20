@@ -62,34 +62,24 @@ def parse_posts_txt(file_path: str) -> Tuple[Dict[int, Dict[str, str]], List[str
         return {}, ["Không đọc được mã hóa của tệp TXT. Hãy lưu tệp dưới dạng UTF-8 hoặc UTF-16 có BOM."]
     except OSError as exc:
         return {}, [f"Không thể đọc tệp TXT {path}: {exc}"]
-    lines = content.splitlines()
-
     current_idx: int | None = None
     current_lines: List[str] = []
 
     def flush_block():
         if current_idx is None:
             return
-        body_lines = list(current_lines)
-        # Cắt dòng trống đầu/cuối
-        while body_lines and not body_lines[0].strip():
-            body_lines.pop(0)
-        while body_lines and not body_lines[-1].strip():
-            body_lines.pop()
-
         title = ""
-        if body_lines and body_lines[0].lstrip().upper().startswith("TITLE:"):
-            title = body_lines[0].split(":", 1)[1].strip()
-            body_lines.pop(0)
-            while body_lines and not body_lines[0].strip():
-                body_lines.pop(0)
+        html = "\n".join(current_lines).strip()
+        if html[:6].upper() == "TITLE:":
+            title_line, _, html = html.partition("\n")
+            title = title_line[6:].strip()
+            html = html.lstrip()
 
-        html = "\n".join(body_lines).strip()
         if not html:
             errors.append(f"[BLOG {current_idx}] đang bị trống nội dung HTML.")
         posts_map[current_idx] = {"title": title, "html": html}
 
-    for line in lines:
+    for line in content.splitlines():
         match = BLOG_HEADER_REGEX.match(line.strip())
         if match:
             flush_block()
@@ -98,9 +88,8 @@ def parse_posts_txt(file_path: str) -> Tuple[Dict[int, Dict[str, str]], List[str
                 errors.append(f"Trùng số thứ tự [BLOG {idx}] trong file TXT.")
             current_idx = idx
             current_lines = []
-        else:
-            if current_idx is not None:
-                current_lines.append(line)
+        elif current_idx is not None:
+            current_lines.append(line)
 
     flush_block()
 

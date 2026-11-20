@@ -39,7 +39,8 @@ AutoBlog/
 ├── parsers.py              # Bộ phân tích danh sách Gmail và nội dung bài viết TXT
 ├── run.bat                 # Khởi chạy 1-click toàn bộ ứng dụng trên Windows
 ├── start_ocr.bat           # Khởi động độc lập OCR Hiragana Server (nếu cần)
-├── requirements.txt        # Danh sách thư viện Python thống nhất (AutoBlog + OCR)
+├── requirements-runtime.txt # Thư viện để chạy ứng dụng desktop và dịch vụ OCR
+├── requirements.txt        # Bản đầy đủ cho Streamlit, báo cáo và kiểm thử
 ├── .env.example            # Mẫu cấu hình biến môi trường và API Key
 ├── .gitignore              # Danh sách loại trừ tệp tạm, dữ liệu nhạy cảm
 ├── README.md               # Tài liệu hướng dẫn sử dụng và triển khai
@@ -84,7 +85,7 @@ AutoBlog/
 - Bấm đúp vào tệp **`run.bat`**.
 - Lần đầu chạy, hệ thống sẽ tự động:
   1. Khởi tạo môi trường ảo `.venv`.
-  2. Cài đặt toàn bộ thư viện từ `requirements.txt`.
+  2. Cài các thư viện chạy ứng dụng và dịch vụ OCR từ `requirements-runtime.txt`.
   3. Cài đặt trình duyệt Playwright Chromium.
   4. Khởi chạy giao diện chính của ứng dụng.
 
@@ -129,9 +130,10 @@ python app.py
 
 ## 🧪 Chạy kiểm thử tự động
 
-Từ thư mục gốc, chạy toàn bộ kiểm thử sau khi cài các thư viện và Chromium theo hướng dẫn ở trên. Các bài kiểm tra xuất bản dùng trang HTML cục bộ.
+Từ thư mục gốc, cài bộ thư viện đầy đủ rồi chạy kiểm thử. Chromium cần được cài qua `run.bat` hoặc theo hướng dẫn cài thủ công ở trên. Các bài kiểm tra xuất bản dùng trang HTML cục bộ.
 
 ```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m unittest discover -v
 ```
 
