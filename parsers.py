@@ -1,3 +1,4 @@
+import codecs
 import re
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -51,10 +52,16 @@ def parse_posts_txt(file_path: str) -> Tuple[Dict[int, Dict[str, str]], List[str
     errors: List[str] = []
     posts_map: Dict[int, Dict[str, str]] = {}
 
-    if not path.is_file():
+    try:
+        data = path.read_bytes()
+        encoding = "utf-16" if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)) else "utf-8-sig"
+        content = data.decode(encoding)
+    except FileNotFoundError:
         return {}, [f"Không tìm thấy file: {file_path}"]
-
-    content = path.read_text(encoding="utf-8-sig")
+    except UnicodeError:
+        return {}, ["Không đọc được mã hóa của tệp TXT. Hãy lưu tệp dưới dạng UTF-8 hoặc UTF-16 có BOM."]
+    except OSError as exc:
+        return {}, [f"Không thể đọc tệp TXT {path}: {exc}"]
     lines = content.splitlines()
 
     current_idx: int | None = None

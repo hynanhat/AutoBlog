@@ -1,18 +1,18 @@
 === [BLOG 1] ===
 TITLE: Hướng dẫn sử dụng dịch vụ trực tuyến an toàn
-&lt;p&gt;Đây là đoạn mở đầu cho bài viết số 1 với mã HTML chuẩn.&lt;/p&gt;
-&lt;h2&gt;Các tính năng chính&lt;/h2&gt;
-&lt;ul&gt;
-  &lt;li&gt;Tối ưu hóa tốc độ truy cập&lt;/li&gt;
-  &lt;li&gt;Giao diện thân thiện trên thiết bị di động&lt;/li&gt;
-&lt;/ul&gt;
-&lt;p&gt;Xem thêm chi tiết tại &lt;a href=&quot;https://example.com/blog-1&quot;&gt;trang thông tin chính thức&lt;/a&gt;.&lt;/p&gt;
+<p>Đây là đoạn mở đầu cho bài viết số 1 với mã HTML chuẩn.</p>
+<h2>Các tính năng chính</h2>
+<ul>
+  <li>Tối ưu hóa tốc độ truy cập</li>
+  <li>Giao diện thân thiện trên thiết bị di động</li>
+</ul>
+<p>Xem thêm chi tiết tại <a href="https://example.com/blog-1">trang thông tin chính thức</a>.</p>
 
 === [BLOG 2] ===
 TITLE: Tổng hợp kinh nghiệm thiết lập trang web cơ bản
-&lt;p&gt;Nội dung bài viết số 2 dành riêng cho tài khoản Gmail thứ 2.&lt;/p&gt;
-&lt;h2&gt;Lưu ý khi cấu hình&lt;/h2&gt;
-&lt;p&gt;Đảm bảo kiểm tra kỹ đường dẫn liên kết trước khi xuất bản công khai.&lt;/p&gt;
+<p>Nội dung bài viết số 2 dành riêng cho tài khoản Gmail thứ 2.</p>
+<h2>Lưu ý khi cấu hình</h2>
+<p>Đảm bảo kiểm tra kỹ đường dẫn liên kết trước khi xuất bản công khai.</p>
 
 === [BLOG 3] ===
-&lt;p&gt;Bài viết số 3 không ghi dòng TITLE:, hệ thống sẽ tự lấy Tiêu đề mặc định trên giao diện App.&lt;/p&gt;
+<p>Bài viết số 3 không ghi dòng TITLE:, hệ thống sẽ tự lấy Tiêu đề mặc định trên giao diện App.</p>

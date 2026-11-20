@@ -6,8 +6,9 @@ from datetime import datetime
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
-from captcha_hook import ManualCaptchaHook
+from hiragana_hook import ManualHiraganaHook, OCRHiraganaHook
 from ninja_worker import JobConfig, NinjaAutomationRunner
+from ocr_client import HiraganaOCRClient, OCRConfig, ensure_ocr_server_running
 from parsers import parse_gmails, parse_posts_txt, validate_mapping
 
 ctk.set_appearance_mode("System")
@@ -24,8 +25,9 @@ class NinjaBlogApp(ctk.CTk):
         self.posts_map = {}
         self.results_rows = {}
         self.ui_queue: queue.Queue = queue.Queue()
-        self.captcha_waiters: dict[int, tuple[asyncio.AbstractEventLoop, asyncio.Future]] = {}
+        self.hiragana_waiters: dict[int, tuple[asyncio.AbstractEventLoop, asyncio.Future]] = {}
         self.runner: NinjaAutomationRunner | None = None
+        self.stop_requested: bool = False
         self.worker_thread: threading.Thread | None = None
 
         self._build_layout()
@@ -122,6 +124,39 @@ class NinjaBlogApp(ctk.CTk):
         )
         self.lbl_txt_status.grid(row=1, column=0, pady=2, sticky="ew")
 
+        # 4. Tự động hóa giải Hiragana (OCR)
+        ctk.CTkLabel(left, text="Tự động hóa giải Hiragana (OCR)", anchor="w", font=("", 13, "bold")).grid(
+            row=10, column=0, padx=8, pady=(14, 2), sticky="ew"
+        )
+        self.use_ocr_var = ctk.BooleanVar(value=True)
+        self.chk_use_ocr = ctk.CTkCheckBox(
+            left,
+            text="Tự động giải qua OCR Hiragana cục bộ",
+            variable=self.use_ocr_var,
+            command=self._toggle_ocr_options,
+        )
+        self.chk_use_ocr.grid(row=11, column=0, padx=8, pady=4, sticky="w")
+
+        self.frame_ocr = ctk.CTkFrame(left, fg_color="transparent")
+        self.frame_ocr.grid(row=12, column=0, padx=8, pady=2, sticky="ew")
+        self.frame_ocr.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(self.frame_ocr, text="Địa chỉ OCR Server:", anchor="w").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.entry_ocr_url = ctk.CTkEntry(self.frame_ocr, placeholder_text="http://127.0.0.1:8000")
+        self.entry_ocr_url.insert(0, "http://127.0.0.1:8000")
+        self.entry_ocr_url.grid(row=1, column=0, pady=2, sticky="ew")
+
+        self.btn_check_ocr = ctk.CTkButton(
+            self.frame_ocr,
+            text="Kiểm tra kết nối OCR (/health)",
+            fg_color="#2b7a4b",
+            hover_color="#1e5c36",
+            command=self._check_ocr_connection,
+        )
+        self.btn_check_ocr.grid(row=2, column=0, pady=4, sticky="ew")
+
         # ================= CỘT PHẢI: ĐIỀU KHIỂN & KẾT QUẢ =================
         right = ctk.CTkFrame(self)
         right.grid(row=0, column=1, padx=(6, 12), pady=12, sticky="nsew")
@@ -143,20 +178,22 @@ class NinjaBlogApp(ctk.CTk):
         self.btn_export = ctk.CTkButton(ctrl, text="Xuất kết quả (.csv)", command=self._export_csv)
         self.btn_export.pack(side="right", padx=6, pady=8)
 
-        # Thanh điều phối CAPTCHA (tương phản rõ trên cả Light & Dark Mode)
-        self.captcha_bar = ctk.CTkFrame(right, fg_color=("gray88", "#2b2b2b"))
-        self.captcha_bar.grid(row=1, column=0, padx=10, pady=(0, 8), sticky="ew")
-        self.lbl_captcha_wait = ctk.CTkLabel(
-            self.captcha_bar,
-            text="Xác thực CAPTCHA: Sẵn sàng (tự tạm dừng khi cần nhập ký tự).",
+        # Thanh điều phối Hiragana (tương phản rõ trên cả Light & Dark Mode)
+        self.hiragana_bar = ctk.CTkFrame(right, fg_color=("gray88", "#2b2b2b"))
+        self.hiragana_bar.grid(row=1, column=0, padx=10, pady=(0, 8), sticky="ew")
+        self.lbl_hiragana_wait = ctk.CTkLabel(
+            self.hiragana_bar,
+            text="Xác thực Hiragana: Sẵn sàng (tự tạm dừng khi cần nhập ký tự).",
             text_color=("gray15", "gray90"),
             anchor="w",
+            justify="left",
+            wraplength=375,
         )
-        self.lbl_captcha_wait.pack(side="left", padx=10, pady=8)
-        self.btn_captcha_done = ctk.CTkButton(
-            self.captcha_bar, text="Xác nhận đã giải CAPTCHA", state="disabled", command=self._confirm_manual_captcha
+        self.lbl_hiragana_wait.pack(side="left", padx=10, pady=8)
+        self.btn_hiragana_done = ctk.CTkButton(
+            self.hiragana_bar, text="Đã gửi trên Chromium", state="disabled", command=self._confirm_manual_hiragana
         )
-        self.btn_captcha_done.pack(side="right", padx=10, pady=8)
+        self.btn_hiragana_done.pack(side="right", padx=10, pady=8)
 
         # Bảng trạng thái
         self.table_frame = ctk.CTkScrollableFrame(right, label_text="Tiến độ xử lý")
@@ -194,6 +231,41 @@ class NinjaBlogApp(ctk.CTk):
             self.frame_mode1.grid_forget()
             self.frame_mode2.grid(row=9, column=0, padx=8, pady=4, sticky="ew")
 
+    def _toggle_ocr_options(self):
+        if self.use_ocr_var.get():
+            self.frame_ocr.grid(row=12, column=0, padx=8, pady=2, sticky="ew")
+        else:
+            self.frame_ocr.grid_forget()
+
+    def _check_ocr_connection(self):
+        url = self.entry_ocr_url.get().strip() or "http://127.0.0.1:8000"
+        client = HiraganaOCRClient(OCRConfig(base_url=url))
+        threading.Thread(target=self._async_check_ocr, args=(client,), daemon=True).start()
+
+    def _async_check_ocr(self, client: HiraganaOCRClient):
+        # Tự động thử bật server OCR nếu chưa chạy
+        ensure_ocr_server_running(client.config.base_url)
+        ok, info = client.check_health()
+        if ok:
+            inbox = info.get("inbox", "N/A")
+            model = info.get("model", "N/A")
+            msg = (
+                f"Kết nối OCR thành công (HTTP 200 OK)!\n\n"
+                f"- Địa chỉ: {client.config.base_url}\n"
+                f"- Thư mục Inbox: {inbox}\n"
+                f"- Mô hình: {model}"
+            )
+            self.ui_queue.put(("info", ("OCR Sẵn sàng", msg)))
+        else:
+            err = info.get("error", "Không xác định")
+            msg = (
+                f"Không thể kết nối dịch vụ OCR tại {client.config.base_url}.\n\n"
+                f"Chi tiết: {err}\n\n"
+                f"Hãy khởi động server OCR bằng lệnh:\n"
+                f".\\.venv\\Scripts\\python.exe ocr/server.py"
+            )
+            self.ui_queue.put(("error", ("Lỗi kết nối OCR", msg)))
+
     def _pick_txt_file(self):
         path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
         if not path:
@@ -214,12 +286,12 @@ class NinjaBlogApp(ctk.CTk):
             messagebox.showwarning("Thiếu dữ liệu", "Vui lòng nhập ít nhất 1 địa chỉ Gmail.")
             return
 
-        password = self.entry_password.get().strip()
+        password = self.entry_password.get()
         blog_name = self.entry_blog_name.get().strip()
         subdomain = self.entry_subdomain.get().strip()
         shared_title = self.entry_post_title.get().strip()
 
-        if not all([password, blog_name, subdomain]):
+        if not password or not blog_name or not subdomain:
             messagebox.showwarning("Thiếu thông tin", "Vui lòng điền Mật khẩu chung, Tên blog và Subdomain.")
             return
 
@@ -262,9 +334,13 @@ class NinjaBlogApp(ctk.CTk):
             max_concurrent=max_conc,
         )
 
+        self.stop_requested = False
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-        self.worker_thread = threading.Thread(target=self._run_async_worker, args=(config,), daemon=True)
+        ocr_url = None
+        if self.use_ocr_var.get():
+            ocr_url = self.entry_ocr_url.get().strip() or "http://127.0.0.1:8000"
+        self.worker_thread = threading.Thread(target=self._run_async_worker, args=(config, ocr_url), daemon=True)
         self.worker_thread.start()
 
     def _create_row(self, idx: int, email: str):
@@ -288,46 +364,110 @@ class NinjaBlogApp(ctk.CTk):
             "widgets": (lbl_dom, lbl_status, lbl_url),
         }
 
-    def _run_async_worker(self, config: JobConfig):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    def _run_async_worker(self, config: JobConfig, ocr_url: str | None):
+        failure = None
+        try:
+            self._run_job(config, ocr_url)
+        except Exception as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+            self.ui_queue.put(("log", f"Phiên chạy bị gián đoạn: {failure}"))
+        finally:
+            self.ui_queue.put(("finished", failure))
 
-        async def wait_manual_captcha(acc_idx: int, email: str):
+    def _run_job(self, config: JobConfig, ocr_url: str | None):
+        async def wait_manual_hiragana(acc_idx: int, email: str):
+            loop = asyncio.get_running_loop()
             fut = loop.create_future()
-            self.ui_queue.put(("captcha_wait", (acc_idx, email, loop, fut)))
-            return await fut
+            self.ui_queue.put(("hiragana_wait", (acc_idx, email, loop, fut)))
+            try:
+                return await fut
+            finally:
+                self.ui_queue.put(("hiragana_done", acc_idx))
 
-        hook = ManualCaptchaHook(wait_manual_captcha)
-        self.runner = NinjaAutomationRunner(
-            config=config,
-            captcha_hook=hook,
-            on_status=lambda i, e, d, s, u: self.ui_queue.put(("status", (i, e, d, s, u))),
-            on_log=lambda msg: self.ui_queue.put(("log", msg)),
-        )
-        loop.run_until_complete(self.runner.run())
-        self.ui_queue.put(("finished", None))
+        hook = ManualHiraganaHook(wait_manual_hiragana)
+        ocr_client = None
 
-    def _confirm_manual_captcha(self):
-        if not self.captcha_waiters:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            if self.stop_requested:
+                self.ui_queue.put(("log", "Phiên chạy đã bị hủy trước khi bắt đầu."))
+                return
+
+            if ocr_url:
+                # Kiểm tra & tự động khởi chạy OCR Server nếu chưa chạy
+                started_ok, start_msg = ensure_ocr_server_running(ocr_url)
+                if started_ok:
+                    self.ui_queue.put(("log", f"[OCR] {start_msg} ({ocr_url})"))
+                else:
+                    self.ui_queue.put(("log", f"[OCR Cảnh báo] {start_msg}. Sẽ thử kết nối hoặc fallback nhập tay."))
+
+                if self.stop_requested:
+                    self.ui_queue.put(("log", "Phiên chạy đã bị hủy sau khi kiểm tra OCR."))
+                    return
+
+                ocr_client = HiraganaOCRClient(OCRConfig(base_url=ocr_url))
+                try:
+                    ocr_client.start_polling(loop)
+                except Exception as exc:
+                    self.ui_queue.put(("log", f"Lỗi khởi động OCR polling ({exc})."))
+                else:
+                    hook = OCRHiraganaHook(
+                        ocr_client=ocr_client,
+                        fallback_hook=hook,
+                        on_log=lambda msg: self.ui_queue.put(("log", msg)),
+                    )
+            else:
+                self.ui_queue.put(("log", "Chạy ở chế độ xác thực Hiragana thủ công."))
+
+            self.runner = NinjaAutomationRunner(
+                config=config,
+                hiragana_hook=hook,
+                on_status=lambda i, e, d, s, u: self.ui_queue.put(("status", (i, e, d, s, u))),
+                on_log=lambda msg: self.ui_queue.put(("log", msg)),
+            )
+            if self.stop_requested:
+                self.runner.request_stop()
+                return
+
+            self.ui_queue.put(("log", "Đang khởi động Chromium…"))
+            loop.run_until_complete(self.runner.run())
+        finally:
+            try:
+                if ocr_client:
+                    loop.run_until_complete(ocr_client.stop_polling())
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
+
+    def _confirm_manual_hiragana(self):
+        if not self.hiragana_waiters:
             return
-        first_idx = next(iter(self.captcha_waiters))
-        loop, fut = self.captcha_waiters.pop(first_idx)
-        loop.call_soon_threadsafe(fut.set_result, None)
-        self._refresh_captcha_bar()
+        first_idx = next(iter(self.hiragana_waiters))
+        loop, fut = self.hiragana_waiters.pop(first_idx)
 
-    def _refresh_captcha_bar(self):
-        if self.captcha_waiters:
-            first_idx = next(iter(self.captcha_waiters))
+        def confirm():
+            if not fut.done():
+                fut.set_result(None)
+
+        loop.call_soon_threadsafe(confirm)
+        self._refresh_hiragana_bar()
+
+    def _refresh_hiragana_bar(self):
+        if self.hiragana_waiters:
+            first_idx = next(iter(self.hiragana_waiters))
             email = self.results_rows[first_idx]["email"]
-            self.lbl_captcha_wait.configure(
-                text=f"Đang chờ giải CAPTCHA trên Chrome cho [{first_idx}] {email} (còn {len(self.captcha_waiters)} phiên chờ)."
+            self.lbl_hiragana_wait.configure(
+                text=f"Nhập thủ công cho [{first_idx}] {email}\n"
+                     "Trong Chromium, nhập Hiragana và bấm 作成する để gửi. "
+                     "Khi trang chấp nhận, bấm “Đã gửi trên Chromium” ở đây."
             )
-            self.btn_captcha_done.configure(state="normal")
+            self.btn_hiragana_done.configure(state="normal")
         else:
-            self.lbl_captcha_wait.configure(
-                text="Xác thực CAPTCHA: Sẵn sàng (tự tạm dừng khi cần nhập ký tự)."
+            self.lbl_hiragana_wait.configure(
+                text="Xác thực Hiragana: Sẵn sàng (tự tạm dừng khi cần nhập ký tự)."
             )
-            self.btn_captcha_done.configure(state="disabled")
+            self.btn_hiragana_done.configure(state="disabled")
 
     def _poll_ui_queue(self):
         while not self.ui_queue.empty():
@@ -346,20 +486,62 @@ class NinjaBlogApp(ctk.CTk):
             elif kind == "log":
                 self.txt_log.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {payload}\n")
                 self.txt_log.see("end")
-            elif kind == "captcha_wait":
+            elif kind == "hiragana_wait":
                 acc_idx, _email, loop, fut = payload
-                self.captcha_waiters[acc_idx] = (loop, fut)
-                self._refresh_captcha_bar()
+                self.hiragana_waiters[acc_idx] = (loop, fut)
+                self._refresh_hiragana_bar()
+            elif kind == "hiragana_done":
+                self.hiragana_waiters.pop(payload, None)
+                self._refresh_hiragana_bar()
+            elif kind == "info":
+                title, msg = payload
+                messagebox.showinfo(title, msg)
+            elif kind == "error":
+                title, msg = payload
+                messagebox.showerror(title, msg)
             elif kind == "finished":
+                self.runner = None
                 self.btn_start.configure(state="normal")
                 self.btn_stop.configure(state="disabled")
-                messagebox.showinfo("Hoàn tất", "Đã hoàn tất xử lý danh sách tài khoản.")
+
+                pending_count = sum(1 for r in self.results_rows.values() if r["status"] == "Đang chờ")
+                error_count = sum(
+                    1 for r in self.results_rows.values()
+                    if r["status"].startswith("LỖI") or r["status"] == "ĐÃ HỦY" or r["status"] == "Phiên chạy bị gián đoạn"
+                )
+                success_count = sum(1 for r in self.results_rows.values() if r["status"] == "DONE")
+
+                if payload is not None:
+                    for row in self.results_rows.values():
+                        if row["status"] == "Đang chờ":
+                            row["status"] = "Phiên chạy bị gián đoạn"
+                            row["widgets"][1].configure(text=row["status"])
+                    messagebox.showerror("Phiên chạy bị gián đoạn", payload)
+                elif pending_count > 0:
+                    for row in self.results_rows.values():
+                        if row["status"] == "Đang chờ":
+                            row["status"] = "Chưa hoàn tất"
+                            row["widgets"][1].configure(text=row["status"])
+                    messagebox.showwarning(
+                        "Chưa hoàn tất toàn bộ",
+                        f"Kết thúc phiên chạy:\n- Thành công: {success_count}\n- Lỗi/Hủy: {error_count}\n- Chưa thực hiện: {pending_count}"
+                    )
+                else:
+                    if error_count > 0:
+                        messagebox.showwarning(
+                            "Hoàn tất có lỗi",
+                            f"Đã xử lý xong toàn bộ danh sách:\n- Thành công: {success_count}\n- Thất bại: {error_count}"
+                        )
+                    else:
+                        messagebox.showinfo("Hoàn tất", f"Đã hoàn tất thành công {success_count} blog!")
         self.after(150, self._poll_ui_queue)
 
     def _stop_job(self):
+        self.stop_requested = True
+        self.btn_stop.configure(state="disabled")
+        self.ui_queue.put(("log", "Đã nhận lệnh dừng từ người dùng. Đang yêu cầu dừng các tác vụ..."))
         if self.runner:
             self.runner.request_stop()
-            self.btn_stop.configure(state="disabled")
 
     def _export_csv(self):
         if not self.results_rows:

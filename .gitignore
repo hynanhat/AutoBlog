@@ -1,3 +1,7 @@
+# ========================================================
+# Git Ignore Rules for AutoBlog & OCR Hiragana
+# ========================================================
+
 # Python cache & virtual environments
 __pycache__/
 *.py[cod]
@@ -5,18 +9,40 @@ __pycache__/
 .venv/
 venv/
 env/
+.ruff_cache/
+.pytest_cache/
 
-# User data & sensitive account outputs (never commit!)
+# Environment variables & Secrets (TUYỆT ĐỐI KHÔNG COMMIT .env)
+.env
+.env.*
+!.env.example
+
+# User Data & Account Credentials
 *.csv
+!ocr/data/*.csv
 posts.txt
 accounts.txt
 errors/
 logs/
-.env
+hiragana/
+ocr_cursor.json
+*.tmp
+*.part
 
-# OS & IDE files
+# OCR Server runtime state, inbox and SQLite databases
+inbox/
+ocr/inbox/
+.ocr-state/
+ocr/.ocr-state/
+*.sqlite3
+*.lock
+reports/
+ocr/reports/
+
+# OS & IDE metadata
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
 *.zip
+*.tar.gz
