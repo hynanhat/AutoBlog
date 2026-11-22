@@ -55,12 +55,14 @@ def create_app(inbox: Path, service, workers=MAX_WORKERS, *, interval=0.5):
     def health(request):
         watcher = request.app.state.watcher
         healthy = watcher.thread.is_alive() and watcher.scan_error is None
+        latest_cursor = store.max_cursor()
         return UTF8JSONResponse(
             {
                 "status": "ok" if healthy else "error",
                 "inbox": str(inbox),
                 "workers": workers,
                 "model": service.model,
+                "latest_cursor": latest_cursor,
             },
             status_code=200 if healthy else 503,
         )
@@ -78,8 +80,13 @@ def create_app(inbox: Path, service, workers=MAX_WORKERS, *, interval=0.5):
         completed = request.url.path == "/results"
         items = store.page(after, limit, completed=completed)
         field = "cursor" if completed else "id"
+        latest = store.max_cursor() if completed else store.max_id()
         return UTF8JSONResponse(
-            {"items": items, "next_cursor": items[-1][field] if items else after}
+            {
+                "items": items,
+                "next_cursor": items[-1][field] if items else after,
+                "latest_cursor": latest,
+            }
         )
 
     def job(request):

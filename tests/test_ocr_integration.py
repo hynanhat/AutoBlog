@@ -116,10 +116,13 @@ class TestOCRHiraganaIntegration(unittest.TestCase):
         path = parsed.path
 
         if path == "/health":
+            all_results = self.mock_server_data.get("results", [])
+            max_c = max([item.get("cursor", 0) for item in all_results], default=0)
             return MockHTTPResponse({
                 "status": self.mock_server_data.get("status", "ok"),
                 "inbox": self.mock_server_data.get("inbox", ""),
                 "model": self.mock_server_data.get("model", "gemini-2.5-flash"),
+                "latest_cursor": max_c,
             })
 
         elif path == "/results":
@@ -134,11 +137,12 @@ class TestOCRHiraganaIntegration(unittest.TestCase):
                 raise urllib.error.HTTPError(url, 400, "Bad Request", {}, fp)
 
             all_results = self.mock_server_data.get("results", [])
+            max_c = max([item.get("cursor", 0) for item in all_results], default=0)
             # Lọc các items có cursor > after
             matched = [item for item in all_results if item.get("cursor", 0) > after]
             paged = matched[:limit]
             next_cursor = paged[-1]["cursor"] if paged else after
-            return MockHTTPResponse({"items": paged, "next_cursor": next_cursor})
+            return MockHTTPResponse({"items": paged, "next_cursor": next_cursor, "latest_cursor": max_c})
 
         elif path == "/error500":
             fp = io.BytesIO(b'{"error": "Internal Server Error"}')
@@ -496,6 +500,98 @@ class TestOCRHiraganaIntegration(unittest.TestCase):
 
         # Con trỏ vẫn giữ nguyên 5, không bị thay đổi hoặc mất dữ liệu
         self.assertEqual(client.state_store.next_cursor, 5)
+
+    # -------------------------------------------------------------------------
+    # KIỂM THỬ TỰ ĐỘNG ĐỒNG BỘ KHI CON TRỎ ĐÃ LƯU > MỐC MÁY CHỦ
+    # -------------------------------------------------------------------------
+    def test_stale_cursor_higher_than_server_automatically_resets(self):
+        """
+        Kịch bản người dùng gặp phải:
+        - Ứng dụng đã lưu mốc 53 (next_cursor: 53, processed_ids: [1..53]).
+        - Máy chủ OCR bị reset hoặc chỉ có 27 tác vụ (cursor lớn nhất là 27).
+        - Ứng dụng phải tự động phát hiện mốc 53 > 27, đặt lại con trỏ về 0 và xóa processed_ids cũ.
+        - Tác vụ đang chờ (ví dụ task 27) được xử lý thành công và mốc mới được lưu là 27.
+        """
+        pending_file = "ninja-acc-1-12345.png"
+        self.mock_server_data["results"] = [
+            {
+                "id": 27,
+                "cursor": 27,
+                "filename": pending_file,
+                "status": "done",
+                "result": {"text": "あいうえおか", "normalized_text": "あいうえおか", "warnings": []},
+                "error": None,
+            }
+        ]
+
+        config = OCRConfig(base_url="http://127.0.0.1:8000", inbox_dir=self.inbox_dir, state_file=self.state_file)
+        client = HiraganaOCRClient(config)
+
+        # Giả lập trạng thái cũ bị lệch mốc (mốc 53, id 27 đã nằm trong processed_ids cũ)
+        client.state_store.next_cursor = 53
+        client.state_store.processed_ids = set(range(1, 54))
+        client.state_store.save()
+
+        # Đăng ký Future chờ kết quả cho pending_file
+        fut = MockFuture()
+        client._pending_futures[pending_file] = fut
+
+        # Gọi poll_once
+        processed = client.poll_once()
+
+        # Đã xử lý được item 27 thành công
+        self.assertEqual(processed, 1)
+        self.assertTrue(fut.done())
+        self.assertEqual(fut.result(), "あいうえおか")
+
+        # Con trỏ đã được đồng bộ chuẩn theo máy chủ (27)
+        self.assertEqual(client.state_store.next_cursor, 27)
+        self.assertTrue(client.state_store.is_processed(27))
+
+    def test_stale_cursor_fallback_detection_for_legacy_server(self):
+        """
+        Kiểm thử khi máy chủ OCR cũ không trả trường latest_cursor:
+        Client tự động gọi fetch_results_page(after=0) để phát hiện và đặt lại con trỏ.
+        """
+        original_urlopen = self._mock_urlopen
+
+        def mock_legacy_urlopen(req, timeout=None):
+            resp = original_urlopen(req, timeout=timeout)
+            data = json.loads(resp.read().decode("utf-8"))
+            data.pop("latest_cursor", None)
+            return MockHTTPResponse(data, status=resp.status)
+
+        self.urlopen_patcher.stop()
+        patcher = patch("urllib.request.urlopen", side_effect=mock_legacy_urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        pending_file = "ninja-acc-2-999.png"
+        self.mock_server_data["results"] = [
+            {
+                "id": 15,
+                "cursor": 15,
+                "filename": pending_file,
+                "status": "done",
+                "result": {"text": "かきくけこさ", "normalized_text": "かきくけこさ", "warnings": []},
+                "error": None,
+            }
+        ]
+
+        config = OCRConfig(base_url="http://127.0.0.1:8000", inbox_dir=self.inbox_dir, state_file=self.state_file)
+        client = HiraganaOCRClient(config)
+        client.state_store.next_cursor = 40
+        client.state_store.processed_ids = set(range(1, 41))
+        client.state_store.save()
+
+        fut = MockFuture()
+        client._pending_futures[pending_file] = fut
+
+        processed = client.poll_once()
+        self.assertEqual(processed, 1)
+        self.assertTrue(fut.done())
+        self.assertEqual(fut.result(), "かきくけこさ")
+        self.assertEqual(client.state_store.next_cursor, 15)
 
 
 if __name__ == "__main__":

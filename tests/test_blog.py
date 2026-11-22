@@ -5,9 +5,11 @@ from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import urlsplit
 
 from playwright.async_api import async_playwright
 
+from hiragana_hook import ManualHiraganaHook
 from ninja_worker import NeedsManualReview, NinjaAutomationRunner, PublicationUnconfirmed, SELECTORS, login_home_stalled, public_post_matches, publish_post
 from parsers import parse_posts_txt
 
@@ -104,6 +106,86 @@ class PublicationTests(unittest.IsolatedAsyncioTestCase):
         await self.page.goto(home, wait_until="networkidle")
         with patch.dict(SELECTORS, home_url=home):
             self.assertFalse(await login_home_stalled(self.page))
+
+    async def test_stalled_creation_opens_home_without_reposting(self):
+        context = await self.browser.new_context()
+        self.addAsyncCleanup(context.close)
+        requests = []
+        documents = {
+            "/login/": """<input name=email><input id=password>
+                <input type=image alt="ログイン" onclick="location.href='/home/'">""",
+            "/home/": '<a href="/hoge/list.html">My blog</a>',
+            "/home/blog/make": """<form method=post onsubmit="this.elements.authimg.value=''"><input id=name><input id=account>
+                <select id=domain><option value=7>.example.test</option></select>
+                <input name=authimg value="submitted"><button>作成する</button></form>""",
+            "/hoge/list.html": """<a href="https://new.example.test/">HTTPSで表示</a>
+                <a href="/hoge/NewEntry/">ブログを書く</a>""",
+            "/hoge/NewEntry/": """<input name=title><textarea name=body></textarea>
+                <button onclick="document.querySelector('p').textContent='公開しました。'">公開する</button>
+                <p role=status></p>""",
+        }
+
+        async def portal(route):
+            path = urlsplit(route.request.url).path
+            requests.append((route.request.method, path))
+            if route.request.method == "POST":
+                # Chromium keeps displaying the submitted form after a 204 response.
+                await route.fulfill(status=204)
+            else:
+                await route.fulfill(content_type="text/html; charset=utf-8", body=documents.get(path, ""))
+
+        async def submit_in_chromium(idx, email):
+            await context.pages[0].locator("form button").click(no_wait_after=True)
+            await asyncio.Event().wait()  # No confirmation click in the desktop app.
+
+        await context.route("**/*", portal)
+        config = SimpleNamespace(blog_name="My blog", subdomain="new", shared_password="test",
+                                 html_mode=1, shared_title="Title", shared_html="<p>body</p>")
+        status = Mock()
+        runner = NinjaAutomationRunner(config, ManualHiraganaHook(submit_in_chromium), status, Mock())
+        runner._human_delay = AsyncMock()
+        runner._watch_hiragana = AsyncMock()
+        browser = SimpleNamespace(new_context=AsyncMock(return_value=context))
+        with patch("ninja_worker.MAKE_REDIRECT_SECONDS", 1), patch("ninja_worker.MANUAL_REVIEW_SECONDS", 0):
+            await runner._process_account(browser, asyncio.Semaphore(1), 1, "user@example.test")
+
+        post = ("POST", "/home/blog/make")
+        self.assertEqual(requests.count(post), 1)
+        self.assertEqual([r for r in requests[requests.index(post) + 1:] if r[1] in documents],
+                         [("GET", "/home/"), ("GET", "/hoge/list.html"), ("GET", "/hoge/NewEntry/")])
+        self.assertEqual(status.call_args.args[3], "DONE")
+
+    async def test_make_result_on_original_url(self):
+        make = SELECTORS["make_url"]
+        await self.page.route(make, lambda route: route.fulfill(content_type="text/html", body="<form></form>"))
+        await self.page.goto(make)
+        runner = NinjaAutomationRunner(None, Mock(), Mock(), Mock())
+        for message, expected in [("ブログを作成しました。", True), ("入力エラー", False)]:
+            with self.subTest(message=message):
+                await self.page.set_content(f'<p class="alert">{message}</p><input name="authimg">')
+                self.assertIs(await runner._wait_for_make_submission(self.page, timeout_sec=2), expected)
+
+    async def test_stalled_creation_rejects_other_blog_with_same_name(self):
+        await self.page.set_content('<a href="https://older.example.test/">My blog</a>')
+        runner = NinjaAutomationRunner(None, Mock(), Mock(), Mock())
+        with self.assertRaisesRegex(NeedsManualReview, "new.example.test"):
+            await runner._verify_dashboard_host(self.page, "new.example.test", timeout_ms=300)
+
+    async def test_overview_opens_top_blog_when_names_repeat(self):
+        home = "http://portal.test/home/"
+        runner = NinjaAutomationRunner(SimpleNamespace(blog_name="8RP"), Mock(), Mock(), Mock())
+        runner._human_delay = AsyncMock()
+        await self.page.route(home, lambda route: route.fulfill(content_type="text/html", body="""
+            <ul>
+                <li><a href="#new">8RP</a></li>
+                <li><a href="#old">8RP</a></li>
+                <li><a href="#other">HI88</a></li>
+            </ul>
+        """))
+        await self.page.goto(home)
+        with patch.dict(SELECTORS, home_url=home):
+            result = await runner._open_created_blog_dashboard(self.page.context, self.page, 1)
+        self.assertEqual(result.url, home + "#new")
 
     async def test_slow_overview_is_refreshed_once_by_get(self):
         home = "http://portal.test/home/"

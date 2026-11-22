@@ -150,6 +150,13 @@ class OCRStateStore:
             self.next_cursor = next_cursor
             self._save_unlocked()
 
+    def reset(self, new_cursor: int = 0) -> None:
+        """Đặt lại vị trí con trỏ và danh sách id đã xử lý khi máy chủ bị reset hoặc lùi mốc."""
+        with self._lock:
+            self.next_cursor = new_cursor
+            self.processed_ids = set()
+            self._save_unlocked()
+
 
 class HiraganaOCRClient:
     """
@@ -387,6 +394,49 @@ class HiraganaOCRClient:
 
         return processed_in_this_page
 
+    def get_server_latest_cursor(self) -> Optional[int]:
+        """
+        Lấy mốc cursor lớn nhất hiện có trên máy chủ:
+        1. Từ trường 'latest_cursor' trong /health (nếu server hỗ trợ).
+        2. Nếu không có, gọi GET /results?after=0&limit=100 để xác định mốc lớn nhất.
+        """
+        try:
+            ok, health_data = self.check_health()
+            if ok and "latest_cursor" in health_data:
+                return int(health_data["latest_cursor"])
+        except Exception:
+            pass
+
+        try:
+            page0 = self.fetch_results_page(after=0, limit=100)
+            if "latest_cursor" in page0:
+                return int(page0["latest_cursor"])
+            items = page0.get("items", [])
+            if not items:
+                return 0
+            if len(items) < 100:
+                return int(items[-1].get("cursor", 0))
+            return int(items[-1].get("cursor", 0))
+        except Exception as exc:
+            LOG.debug("Không thể lấy mốc cursor máy chủ: %s", exc)
+            return None
+
+    def sync_cursor(self) -> int:
+        """
+        Kiểm tra và tự động đồng bộ con trỏ với máy chủ nếu mốc đã lưu cao hơn mốc máy chủ.
+        Trả về con trỏ hiện tại sau khi đồng bộ.
+        """
+        server_latest = self.get_server_latest_cursor()
+        if server_latest is not None and self.state_store.next_cursor > server_latest:
+            LOG.warning(
+                "Mốc đọc đã lưu (%s) cao hơn mốc hiện có trên máy chủ OCR (%s). "
+                "Tự động đặt lại con trỏ về 0 để không bỏ sót kết quả...",
+                self.state_store.next_cursor,
+                server_latest,
+            )
+            self.state_store.reset(0)
+        return self.state_store.next_cursor
+
     def poll_once(
         self,
         limit: int = 100,
@@ -396,6 +446,8 @@ class HiraganaOCRClient:
         """
         Thực hiện một lần đọc trang từ con trỏ hiện tại:
         - Đọc GET /results?after=<con_trỏ_đã_lưu>&limit=100.
+        - Tự động phát hiện khi con trỏ đã lưu > mốc hiện có của máy chủ
+          (máy chủ bị reset hoặc cơ sở dữ liệu mới), đặt lại về 0 và đồng bộ ngay.
         - Nếu rỗng: giữ nguyên con trỏ.
         - Nếu có lỗi kết nối/5xx: giữ con trỏ và ném lỗi (cho caller retry).
         - Trả về số mục mới được xử lý.
@@ -403,6 +455,30 @@ class HiraganaOCRClient:
         current_cursor = self.state_store.next_cursor
         page_data = self.fetch_results_page(after=current_cursor, limit=limit)
         items = page_data.get("items", [])
+
+        # 1. Kiểm tra trực tiếp từ trường latest_cursor do máy chủ trả về
+        server_latest = page_data.get("latest_cursor")
+        if server_latest is not None and current_cursor > int(server_latest):
+            LOG.warning(
+                "Mốc đọc đã lưu (%s) cao hơn mốc hiện có trên máy chủ (%s). Tự động đặt lại về 0...",
+                current_cursor,
+                server_latest,
+            )
+            self.state_store.reset(0)
+            return self.poll_once(limit, on_done=on_done, on_failed=on_failed)
+
+        # 2. Nếu không có items và cursor > 0, kiểm tra xem máy chủ có bị reset / lùi mốc không
+        if not items and current_cursor > 0 and (self._pending_futures or server_latest is None):
+            detected_latest = self.get_server_latest_cursor()
+            if detected_latest is not None and current_cursor > detected_latest:
+                LOG.warning(
+                    "Phát hiện mốc đã lưu (%s) cao hơn mốc máy chủ (%s). Tự động đặt lại về 0...",
+                    current_cursor,
+                    detected_latest,
+                )
+                self.state_store.reset(0)
+                return self.poll_once(limit, on_done=on_done, on_failed=on_failed)
+
         if not items:
             return 0
         processed = self.process_page_items(page_data, on_done=on_done, on_failed=on_failed)
@@ -411,17 +487,45 @@ class HiraganaOCRClient:
     # -------------------------------------------------------------------------
     # 4. QUẢN LÝ TÁC VỤ BẤT ĐỒNG BỘ (ASYNCIO DISPATCH)
     # -------------------------------------------------------------------------
+    @staticmethod
+    def _safe_set_result(future: Any, val: str) -> None:
+        if hasattr(future, "done") and not future.done():
+            future.set_result(val)
+        elif not hasattr(future, "done"):
+            future.set_result(val)
+
+    @staticmethod
+    def _safe_set_exception(future: Any, exc: Exception) -> None:
+        if hasattr(future, "done") and not future.done():
+            future.set_exception(exc)
+        elif not hasattr(future, "done"):
+            future.set_exception(exc)
+
     def _dispatch_future_success(self, filename: str, result_text: str) -> None:
         future = self._pending_futures.pop(filename, None)
         self._pending_meta.pop(filename, None)
-        if future and not future.done():
-            future.set_result(result_text)
+        if future and (not hasattr(future, "done") or not future.done()):
+            try:
+                loop = future.get_loop() if hasattr(future, "get_loop") else None
+                if loop is not None and loop.is_running():
+                    loop.call_soon_threadsafe(self._safe_set_result, future, result_text)
+                else:
+                    self._safe_set_result(future, result_text)
+            except Exception:
+                self._safe_set_result(future, result_text)
 
     def _dispatch_future_failure(self, filename: str, error: Exception) -> None:
         future = self._pending_futures.pop(filename, None)
         self._pending_meta.pop(filename, None)
-        if future and not future.done():
-            future.set_exception(error)
+        if future and (not hasattr(future, "done") or not future.done()):
+            try:
+                loop = future.get_loop() if hasattr(future, "get_loop") else None
+                if loop is not None and loop.is_running():
+                    loop.call_soon_threadsafe(self._safe_set_exception, future, error)
+                else:
+                    self._safe_set_exception(future, error)
+            except Exception:
+                self._safe_set_exception(future, error)
 
     async def solve_image(
         self,
@@ -483,6 +587,11 @@ class HiraganaOCRClient:
 
     def start_polling(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         """Khởi động polling nền trong event loop."""
+        try:
+            self.sync_cursor()
+        except Exception as exc:
+            LOG.debug("Không thể đồng bộ con trỏ khi bắt đầu polling: %s", exc)
+
         if self._polling_task is None or self._polling_task.done():
             if loop is not None:
                 target_loop = loop

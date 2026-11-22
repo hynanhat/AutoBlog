@@ -118,6 +118,16 @@ class JobStore:
             ).fetchone()
             return self.public(row) if row is not None else None
 
+    def max_cursor(self) -> int:
+        with self.connect() as db:
+            row = db.execute("SELECT COALESCE(MAX(cursor), 0) FROM jobs").fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+    def max_id(self) -> int:
+        with self.connect() as db:
+            row = db.execute("SELECT COALESCE(MAX(id), 0) FROM jobs").fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
 
 def file_stamp(info):
     return f"{info.st_dev}/{info.st_ino}/{info.st_mtime_ns}/{info.st_ctime_ns}/{info.st_size}"

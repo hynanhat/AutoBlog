@@ -249,11 +249,22 @@ class NinjaBlogApp(ctk.CTk):
         if ok:
             inbox = info.get("inbox", "N/A")
             model = info.get("model", "N/A")
+            server_cursor = client.get_server_latest_cursor()
+            old_cursor = client.state_store.next_cursor
+            client.sync_cursor()
+            new_cursor = client.state_store.next_cursor
+            cursor_info = f"{new_cursor}"
+            if old_cursor > (server_cursor if server_cursor is not None else 0):
+                cursor_info += f" (Đã tự động đặt lại từ {old_cursor} vì máy chủ ở mốc {server_cursor})"
+            elif server_cursor is not None:
+                cursor_info += f" (Khớp mốc máy chủ: {server_cursor})"
+
             msg = (
                 f"Kết nối OCR thành công (HTTP 200 OK)!\n\n"
                 f"- Địa chỉ: {client.config.base_url}\n"
                 f"- Thư mục Inbox: {inbox}\n"
-                f"- Mô hình: {model}"
+                f"- Mô hình: {model}\n"
+                f"- Mốc con trỏ kết quả: {cursor_info}"
             )
             self.ui_queue.put(("info", ("OCR Sẵn sàng", msg)))
         else:

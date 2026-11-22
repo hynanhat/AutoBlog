@@ -376,6 +376,42 @@ class TestHiraganaRetryAndManualFallback(unittest.TestCase):
         self.assertTrue(step_result)
         runner._handle_manual_hiragana.assert_not_called()
 
+    def test_ocr_retry_rechecks_terms_checkboxes(self):
+        """
+        Khi thử lại OCR, đảm bảo các ô điều khoản (#adult, #rule) được kiểm tra và tick lại nếu bị bỏ chọn khi trang reload.
+        """
+        ocr_client = MagicMock(spec=HiraganaOCRClient)
+        ocr_hook = OCRHiraganaHook(ocr_client=ocr_client)
+        ocr_hook.solve_ocr = AsyncMock(return_value="あいうえおか")
+
+        runner = NinjaAutomationRunner(
+            config=self.config,
+            hiragana_hook=ocr_hook,
+            on_status=self.on_status,
+            on_log=self.on_log,
+        )
+        runner._human_delay = AsyncMock()
+        runner._capture_hiragana_image = AsyncMock(return_value=b"fake_image_bytes")
+        runner._wait_for_make_submission = AsyncMock(return_value=True)
+
+        page, mock_input, mock_submit, _ = self._create_mock_page()
+        mock_cb = AsyncMock()
+        mock_cb.first = mock_cb
+        mock_cb.count = AsyncMock(return_value=1)
+        mock_cb.is_checked = AsyncMock(return_value=False)
+        mock_cb.check = AsyncMock()
+
+        orig_locator = page.locator
+        def locator_with_cb(sel):
+            if "#adult" in sel or "#rule" in sel:
+                return mock_cb
+            return orig_locator(sel)
+        page.locator = MagicMock(side_effect=locator_with_cb)
+
+        success = run_coro(runner._process_hiragana_step(page, 1, "test1@gmail.com", "ninja.jp"))
+        self.assertTrue(success)
+        self.assertEqual(mock_cb.check.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
