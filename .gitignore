@@ -16,6 +16,8 @@ env/
 .env
 .env.*
 !.env.example
+api_keys.txt
+.key_usage.json
 
 # User Data & Account Credentials
 *.csv
@@ -24,6 +26,7 @@ posts.txt
 accounts.txt
 errors/
 logs/
+*.log
 hiragana/
 ocr_cursor.json
 *.tmp

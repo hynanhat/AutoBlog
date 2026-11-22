@@ -18,21 +18,40 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 set "PYTHON_RUNNER=.venv\Scripts\python.exe"
-echo [2/3] Dang kiem tra thu vien trong requirements-runtime.txt...
-"%PYTHON_RUNNER%" -m pip install --disable-pip-version-check -r requirements-runtime.txt
-if errorlevel 1 (
-    echo [LOI] Khong the cai dat cac thu vien.
-    goto :failed
-)
+set "RUNTIME_STAMP=.venv\runtime-requirements-installed.txt"
 
-echo [3/3] Dang kiem tra trinh duyet Playwright Chromium...
+set "REINSTALL_ARG="
+if /i "%~1"=="--repair" (
+    set "REINSTALL_ARG=--force-reinstall"
+    goto :install_runtime
+)
+if not exist "%RUNTIME_STAMP%" goto :install_runtime
+
+fc.exe /b "requirements-runtime.txt" "%RUNTIME_STAMP%" >nul 2>&1
+if errorlevel 1 goto :install_runtime
+
+"%PYTHON_RUNNER%" check_runtime.py
+if errorlevel 1 goto :install_runtime
+
+goto :start_app
+
+:install_runtime
+echo Dang cai dat thu vien Python...
+"%PYTHON_RUNNER%" -m pip install --disable-pip-version-check %REINSTALL_ARG% -r requirements-runtime.txt
+if errorlevel 1 goto :failed
+
+echo Dang kiem tra va cai dat Chromium...
 "%PYTHON_RUNNER%" -m playwright install chromium
-if errorlevel 1 (
-    echo [LOI] Khong the cai dat Chromium.
-    goto :failed
-)
+if errorlevel 1 goto :failed
 
-echo Dang khoi chay ung dung AutoBlog...
+"%PYTHON_RUNNER%" check_runtime.py
+if errorlevel 1 goto :failed
+
+copy /y "requirements-runtime.txt" "%RUNTIME_STAMP%" >nul
+if errorlevel 1 goto :failed
+
+:start_app
+echo Dang mo AutoBlog...
 "%PYTHON_RUNNER%" app.py
 if errorlevel 1 goto :failed
 exit /b 0

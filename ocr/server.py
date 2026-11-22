@@ -18,8 +18,9 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from config import MAX_WORKERS, configured_model
+from config import MAX_WORKERS, configured_models
 from folder_ocr import FolderWatcher, JobStore
+from key_pool import APIKeyPool, load_keys_from_sources
 from ocr_service import OCRService
 MAX_ID = (1 << 63) - 1
 
@@ -56,6 +57,11 @@ def create_app(inbox: Path, service, workers=MAX_WORKERS, *, interval=0.5):
         watcher = request.app.state.watcher
         healthy = watcher.thread.is_alive() and watcher.scan_error is None
         latest_cursor = store.max_cursor()
+        key_pool_summary = (
+            watcher.service.key_pool.get_status_summary()
+            if hasattr(watcher.service, "key_pool")
+            else None
+        )
         return UTF8JSONResponse(
             {
                 "status": "ok" if healthy else "error",
@@ -63,6 +69,7 @@ def create_app(inbox: Path, service, workers=MAX_WORKERS, *, interval=0.5):
                 "workers": workers,
                 "model": service.model,
                 "latest_cursor": latest_cursor,
+                "key_pool": key_pool_summary,
             },
             status_code=200 if healthy else 503,
         )
@@ -80,12 +87,10 @@ def create_app(inbox: Path, service, workers=MAX_WORKERS, *, interval=0.5):
         completed = request.url.path == "/results"
         items = store.page(after, limit, completed=completed)
         field = "cursor" if completed else "id"
-        latest = store.max_cursor() if completed else store.max_id()
         return UTF8JSONResponse(
             {
                 "items": items,
                 "next_cursor": items[-1][field] if items else after,
-                "latest_cursor": latest,
             }
         )
 
@@ -108,9 +113,10 @@ def create_app(inbox: Path, service, workers=MAX_WORKERS, *, interval=0.5):
 
 
 def main(argv=None):
-    load_dotenv(ROOT / ".env")
-    if not os.getenv("GEMINI_API_KEY") and (ROOT.parent / ".env").is_file():
-        load_dotenv(ROOT.parent / ".env")
+    if (ROOT.parent / ".env").is_file():
+        load_dotenv(ROOT.parent / ".env", override=True)
+    if (ROOT / ".env").is_file():
+        load_dotenv(ROOT / ".env", override=True)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inbox", type=Path, default=ROOT / "inbox")
     parser.add_argument("--host", default="127.0.0.1")
@@ -118,7 +124,7 @@ def main(argv=None):
     parser.add_argument(
         "--workers", type=int, choices=range(1, MAX_WORKERS + 1), default=MAX_WORKERS
     )
-    parser.add_argument("--model", default=configured_model())
+    parser.add_argument("--model")
     parser.add_argument(
         "--delay",
         type=float,
@@ -131,7 +137,17 @@ def main(argv=None):
     if not math.isfinite(args.delay):
         parser.error("--delay phải là số hữu hạn.")
     try:
-        service = OCRService(os.getenv("GEMINI_API_KEY", ""), args.model, args.delay)
+        keys_list = load_keys_from_sources(base_dir=ROOT)
+        models_list = configured_models()
+
+        if args.model is not None:
+            selected = args.model.strip()
+            if not selected:
+                raise ValueError("--model phải chứa tên model.")
+            models_list = [selected] + [m for m in models_list if m != selected]
+
+        pool = APIKeyPool(keys=keys_list, models=models_list, max_rpm=12, max_rpd=450)
+        service = OCRService(key_pool=pool, delay=args.delay)
     except ValueError as exc:
         parser.error(str(exc))
     uvicorn.run(

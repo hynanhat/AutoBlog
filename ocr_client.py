@@ -691,7 +691,7 @@ def ensure_ocr_server_running(
 
     # Tự động khởi chạy tiến trình server.py
     try:
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
         subprocess.Popen(
             [str(selected_python), str(server_py)],
             cwd=str(ocr_dir),

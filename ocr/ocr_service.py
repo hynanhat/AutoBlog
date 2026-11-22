@@ -1,5 +1,6 @@
 """Gemini OCR for a single local image per request."""
 
+import logging
 import math
 import time
 from collections import OrderedDict
@@ -9,6 +10,7 @@ from email.utils import parsedate_to_datetime
 from hashlib import sha256
 from itertools import islice
 from threading import Condition, Lock
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -18,6 +20,9 @@ from pydantic import ValidationError
 
 from config import DEFAULT_MODEL, MAX_WORKERS
 from formatter import Transcription, format_reading
+from key_pool import APIKeyPool, DEFAULT_MODELS, load_keys_from_sources, mask_key
+
+LOG = logging.getLogger("ocr_service")
 
 PROMPT = (
     "Copy visible random hiragana in order, including small kana and voicing. "
@@ -92,6 +97,9 @@ class ReadingCache:
             self.pending.add(key)
         try:
             reading = read()
+            if reading is None:
+                raise RuntimeError("Dịch vụ OCR không trả về kết quả.")
+
             with self.condition:
                 self.entries[key] = reading
                 if len(self.entries) > CACHE_LIMIT:
@@ -114,19 +122,24 @@ class Usage:
 class OCRService:
     def __init__(
         self,
-        api_key: str,
+        api_key: Optional[str] = None,
         model: str = DEFAULT_MODEL,
         delay: float = 1.0,
         *,
         cache=None,
+        key_pool: Optional[APIKeyPool] = None,
+        models: Optional[list] = None,
     ):
-        if not api_key or not api_key.strip():
-            raise ValueError("Cần nhập GEMINI_API_KEY để chạy OCR.")
-        if not model.strip() or delay < 0:
-            raise ValueError("Tên model phải khác rỗng và thời gian chờ phải không âm.")
-        self._api_key = api_key.strip()
-        self._client = None
-        self.model = model.strip()
+        if not math.isfinite(delay) or delay < 0:
+            raise ValueError("Thời gian chờ (delay) phải là số hữu hạn không âm.")
+        if key_pool is not None:
+            self.key_pool = key_pool
+        else:
+            raw_keys = [api_key] if api_key and api_key.strip() else None
+            model_list = models or ([model] if model and model.strip() else None)
+            self.key_pool = APIKeyPool(keys=raw_keys, models=model_list)
+
+        self.model = self.key_pool.models[0]
         self.delay = delay
         self.last_call = None
         self._resume_at = 0.0
@@ -137,29 +150,25 @@ class OCRService:
 
     @property
     def client(self):
-        if self._client is None:
-            self._client = genai.Client(
-                api_key=self._api_key,
-                http_options=types.HttpOptions(
-                    timeout=60000, retry_options=types.HttpRetryOptions(attempts=1)
-                ),
-            )
-        return self._client
+        """Trả về client của key đầu tiên cho mục đích tương thích ngược."""
+        if self.key_pool.keys:
+            return self.key_pool._get_client(self.key_pool.keys[0])
+        return None
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_):
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        if hasattr(self, "key_pool"):
+            self.key_pool.close()
 
-    def _config(self, shape, interactive):
-        model_id = self.model.removeprefix("models/")
+    def _config(self, shape, interactive, model_name: Optional[str] = None):
+        target_model = model_name or self.model
+        model_id = target_model.removeprefix("models/")
         options = {}
-        if model_id == "gemini-3.1-flash-lite" and max(shape[:2]) <= 384:
+        if model_id in ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite") and max(shape[:2]) <= 384:
             options["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
-        if model_id == "gemini-2.5-flash":
+        if model_id in ("gemini-2.5-flash", "gemini-3.5-flash"):
             options["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
         return types.GenerateContentConfig(
             http_options=types.HttpOptions(timeout=45000) if interactive else None,
@@ -189,11 +198,14 @@ class OCRService:
         if not ok:
             raise ValueError("Không thể mã hóa ảnh để nhận diện.")
         part = types.Part.from_bytes(data=data.tobytes(), mime_type="image/png")
-        config = self._config(image.shape, interactive)
-        attempts = 1 if interactive else 4
+        attempts = 1 if interactive else max(len(self.key_pool.keys) * len(self.key_pool.models) * 2, 4)
+
         for attempt in range(attempts):
+            # Điều phối lấy Key và Model an toàn từ KeyPool
+            api_key, active_model, client = self.key_pool.acquire_key()
+            config = self._config(image.shape, interactive, model_name=active_model)
+
             with self._start_lock:
-                client = self.client
                 if self.last_call is not None:
                     wait = (
                         max(self.last_call + self.delay, self._resume_at)
@@ -203,39 +215,69 @@ class OCRService:
                         time.sleep(wait)
                 self.last_call = time.monotonic()
                 self.usage.api_requests += 1
+
             try:
                 response = client.models.generate_content(
-                    model=self.model,
+                    model=active_model,
                     contents=[PROMPT, part],
                     config=config,
                 )
             except errors.APIError as exc:
-                if exc.code in (429, 500, 502, 503, 504) and attempt + 1 < attempts:
-                    pause = (
-                        rate_limit_wait(exc, attempt)
-                        if exc.code == 429
-                        else 2 ** (attempt + 1)
-                    )
-                    if pause <= 120:
-                        if exc.code == 429:
-                            with self._start_lock:
-                                self._resume_at = max(
-                                    self._resume_at, time.monotonic() + pause
-                                )
-                        time.sleep(pause)
+                if exc.code == 429:
+                    pause = rate_limit_wait(exc, attempt)
+                    with self._start_lock:
+                        self._resume_at = max(
+                            self._resume_at, time.monotonic() + pause
+                        )
+                    self.key_pool.record_rate_limit(api_key, active_model, pause)
+                    if attempt + 1 >= attempts:
+                        raise RuntimeError(
+                            f"Gemini giới hạn tần suất yêu cầu (HTTP 429). "
+                            f"Vui lòng thử lại sau {math.ceil(pause)} giây."
+                        ) from exc
+                    if len(self.key_pool.keys) > 1 and self.key_pool.has_available_key(exclude_key=api_key):
                         continue
+                    time.sleep(pause)
+                    continue  # Lập tức xoay sang key/model tiếp theo!
+                if exc.code == 401 or (exc.code in (400, 403) and "API_KEY_INVALID" in str(exc)):
+                    self.key_pool.record_invalid(api_key)
+                    remaining_valid_keys = any(
+                        not slot.is_invalid
+                        for (k, m), slot in self.key_pool._tracked.items()
+                    )
+                    if not interactive and remaining_valid_keys and attempt + 1 < attempts:
+                        LOG.warning(
+                            "Khóa API %s không hợp lệ hoặc hết hạn (HTTP %s). Tự động chuyển sang khóa tiếp theo...",
+                            mask_key(api_key),
+                            exc.code,
+                        )
+                        continue
+                    raise RuntimeError(
+                        f"Gemini báo khóa API không hợp lệ hoặc hết hạn (HTTP {exc.code}). "
+                        "Vui lòng kiểm tra lại GEMINI_API_KEY trong .env."
+                    ) from exc
+
+                if exc.code == 403:
+                    raise RuntimeError(
+                        "Gemini từ chối quyền truy cập (HTTP 403). "
+                        "Kiểm tra quyền của khóa đối với model đã chọn."
+                    ) from exc
+                if exc.code in (500, 502, 503, 504) and attempt + 1 < attempts:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
                 if exc.code == 404:
                     raise RuntimeError(
-                        f"Gemini không tìm thấy model {self.model} cho tài khoản này (HTTP 404). "
-                        "Chọn model khác ở thanh bên hoặc bằng --model."
+                        f"Gemini không tìm thấy model {active_model} cho tài khoản này (HTTP 404). "
+                        "Chọn model khác bằng --model hoặc GEMINI_MODELS."
                     ) from exc
                 if exc.code == 504:
                     raise RuntimeError(
-                        f"Gemini hết thời gian xử lý với {self.model} (HTTP 504). Bạn có thể thử lại."
+                        f"Gemini hết thời gian xử lý với {active_model} (HTTP 504). Bạn có thể thử lại."
                     ) from exc
                 raise RuntimeError(
                     f"Gemini trả lỗi HTTP {exc.code}. Kiểm tra model, khóa và hạn mức."
                 ) from exc
+
             usage = response.usage_metadata
             if usage is not None and usage.total_token_count is not None:
                 with self._usage_lock:

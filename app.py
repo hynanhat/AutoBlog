@@ -3,6 +3,7 @@ import csv
 import queue
 import threading
 from datetime import datetime
+from time import perf_counter
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import webbrowser
@@ -261,12 +262,31 @@ class NinjaBlogApp(ctk.CTk):
             elif server_cursor is not None:
                 cursor_info += f" (Khớp mốc máy chủ: {server_cursor})"
 
+            key_pool = info.get("key_pool")
+            pool_info = ""
+            if key_pool:
+                total_k = key_pool.get("total_keys", 1)
+                models_list = ", ".join(key_pool.get("models", [model]))
+                rem_rpd = key_pool.get("total_remaining_rpd", 0)
+                details = key_pool.get("details", [])
+                lines = []
+                for d in details[:6]:
+                    lines.append(f"  • {d.get('key_masked')} [{d.get('model')}]: RPM {d.get('rpm')}, RPD {d.get('rpd')} ({d.get('status')})")
+                pool_info = (
+                    f"\n\n[Quản lý Hồ bơi API Key & Model]\n"
+                    f"- Tổng số API Key: {total_k}\n"
+                    f"- Chuỗi Model dự phòng: {models_list}\n"
+                    f"- Dung lượng còn lại hôm nay: {rem_rpd} lượt\n"
+                    + "\n".join(lines)
+                )
+
             msg = (
                 f"Kết nối OCR thành công (HTTP 200 OK)!\n\n"
                 f"- Địa chỉ: {client.config.base_url}\n"
                 f"- Thư mục Inbox: {inbox}\n"
-                f"- Mô hình: {model}\n"
+                f"- Mô hình hiện hành: {model}\n"
                 f"- Mốc con trỏ kết quả: {cursor_info}"
+                f"{pool_info}"
             )
             self.ui_queue.put(("info", ("OCR Sẵn sàng", msg)))
         else:
@@ -597,42 +617,66 @@ class NinjaBlogApp(ctk.CTk):
             )
             self.btn_hiragana_done.configure(state="disabled")
 
+    def _handle_ui_event(self, kind, payload):
+        if kind == "status":
+            idx, _email, domain, status, url = payload
+            row = self.results_rows.get(idx)
+            if row:
+                row["domain"] = domain
+                row["status"] = status
+                row["url"] = url
+                lbl_dom, lbl_status, lbl_url = row["widgets"]
+                lbl_dom.configure(text=domain)
+                lbl_status.configure(text=status)
+                if url:
+                    lbl_url.configure(text=url, text_color=("#1d4ed8", "#60a5fa"))
+                else:
+                    lbl_url.configure(text="", text_color=("gray10", "gray90"))
+        elif kind == "hiragana_wait":
+            acc_idx, _email, loop, fut = payload
+            self.hiragana_waiters[acc_idx] = (loop, fut)
+            self._refresh_hiragana_bar()
+        elif kind == "hiragana_done":
+            self.hiragana_waiters.pop(payload, None)
+            self._refresh_hiragana_bar()
+        elif kind == "info":
+            title, msg = payload
+            messagebox.showinfo(title, msg)
+        elif kind == "error":
+            title, msg = payload
+            messagebox.showerror(title, msg)
+        elif kind == "finished":
+            self._finish_job(payload)
+
     def _poll_ui_queue(self):
-        while not self.ui_queue.empty():
-            kind, payload = self.ui_queue.get()
-            if kind == "status":
-                idx, _email, domain, status, url = payload
-                row = self.results_rows.get(idx)
-                if row:
-                    row["domain"] = domain
-                    row["status"] = status
-                    row["url"] = url
-                    lbl_dom, lbl_status, lbl_url = row["widgets"]
-                    lbl_dom.configure(text=domain)
-                    lbl_status.configure(text=status)
-                    if url:
-                        lbl_url.configure(text=url, text_color=("#1d4ed8", "#60a5fa"))
-                    else:
-                        lbl_url.configure(text="", text_color=("gray10", "gray90"))
-            elif kind == "log":
-                self.txt_log.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {payload}\n")
+        pending_logs = []
+        deadline = perf_counter() + 0.008
+
+        def flush_logs():
+            if pending_logs:
+                self.txt_log.insert("end", "".join(pending_logs))
                 self.txt_log.see("end")
-            elif kind == "hiragana_wait":
-                acc_idx, _email, loop, fut = payload
-                self.hiragana_waiters[acc_idx] = (loop, fut)
-                self._refresh_hiragana_bar()
-            elif kind == "hiragana_done":
-                self.hiragana_waiters.pop(payload, None)
-                self._refresh_hiragana_bar()
-            elif kind == "info":
-                title, msg = payload
-                messagebox.showinfo(title, msg)
-            elif kind == "error":
-                title, msg = payload
-                messagebox.showerror(title, msg)
-            elif kind == "finished":
-                self._finish_job(payload)
-        self.after(150, self._poll_ui_queue)
+                pending_logs.clear()
+
+        for _ in range(100):
+            try:
+                kind, payload = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if kind == "log":
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                pending_logs.append(f"[{timestamp}] {payload}\n")
+            else:
+                flush_logs()
+                self._handle_ui_event(kind, payload)
+
+            if perf_counter() >= deadline:
+                break
+
+        flush_logs()
+        delay_ms = 150 if self.ui_queue.empty() else 10
+        self.after(delay_ms, self._poll_ui_queue)
 
     def _finish_job(self, failure: str | None):
         self.runner = None

@@ -1,0 +1,14 @@
+# ==============================================================================
+# DANH SÁCH GOOGLE GEMINI API KEYS DỰ PHÒNG CHO OCR HIRAGANA
+# ==============================================================================
+# Hướng dẫn:
+# 1. Tạo bản sao của tệp này và đổi tên thành: api_keys.txt
+# 2. Dán mỗi API Key trên một dòng (lấy miễn phí từ https://aistudio.google.com/apikey).
+# 3. Hệ thống sẽ tự động nạp toàn bộ key và xoay vòng chủ động:
+#    - Khi key 1 gần chạm 12/15 RPM hoặc 450/500 RPD, tự động chuyển sang key 2.
+#    - Tự động fallback từ gemini-3.1-flash-lite sang gemini-3.5-flash-lite.
+#
+# Ví dụ:
+# AIzaSyA111111111111111111111111111111111
+# AIzaSyB222222222222222222222222222222222
+# AIzaSyC333333333333333333333333333333333
