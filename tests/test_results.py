@@ -35,3 +35,88 @@ class JobResultTests(unittest.TestCase):
                     )
                 else:
                     dialog.showerror.assert_called_once_with("Phiên chạy bị gián đoạn", failure)
+
+    def test_copy_entire_row(self):
+        copied = []
+        rows = {
+            1: {
+                "email": "test@gmail.com",
+                "domain": "ninja.jp",
+                "status": "Hoàn tất",
+                "url": "https://myblog.ninja.jp/",
+                "all_widgets": (),
+            }
+        }
+        app = SimpleNamespace(
+            results_rows=rows,
+            _flash_row=Mock(),
+            _copy_to_clipboard=lambda text, msg="": copied.append((text, msg)),
+        )
+        NinjaBlogApp._copy_entire_row(app, 1)
+        self.assertEqual(len(copied), 1)
+        self.assertEqual(copied[0][0], "1\ttest@gmail.com\tninja.jp\tHoàn tất\thttps://myblog.ninja.jp/")
+        self.assertIn("Dòng #1", copied[0][1])
+
+    def test_copy_cell_or_row_url(self):
+        copied = []
+        rows = {
+            1: {
+                "email": "test@gmail.com",
+                "domain": "ninja.jp",
+                "status": "Hoàn tất",
+                "url": "https://myblog.ninja.jp/",
+                "all_widgets": (),
+            }
+        }
+        app = SimpleNamespace(
+            results_rows=rows,
+            _flash_row=Mock(),
+            _copy_to_clipboard=lambda text, msg="": copied.append((text, msg)),
+            _copy_entire_row=Mock(),
+        )
+        NinjaBlogApp._copy_cell_or_row(app, 1, "url")
+        self.assertEqual(len(copied), 1)
+        self.assertEqual(copied[0][0], "https://myblog.ninja.jp/")
+        self.assertIn("Link Blog", copied[0][1])
+        app._copy_entire_row.assert_not_called()
+
+    def test_copy_cell_or_row_fallback_when_url_empty(self):
+        copied = []
+        rows = {
+            1: {
+                "email": "test@gmail.com",
+                "domain": "-",
+                "status": "Đang chờ",
+                "url": "",
+                "all_widgets": (),
+            }
+        }
+        app = SimpleNamespace(
+            results_rows=rows,
+            _flash_row=Mock(),
+            _copy_entire_row=Mock(),
+        )
+        NinjaBlogApp._copy_cell_or_row(app, 1, "url")
+        app._copy_entire_row.assert_called_once_with(1)
+
+    def test_copy_cell_or_row_email(self):
+        copied = []
+        rows = {
+            1: {
+                "email": "test@gmail.com",
+                "domain": "-",
+                "status": "Đang chờ",
+                "url": "",
+                "all_widgets": (),
+            }
+        }
+        app = SimpleNamespace(
+            results_rows=rows,
+            _flash_row=Mock(),
+            _copy_to_clipboard=lambda text, msg="": copied.append((text, msg)),
+            _copy_entire_row=Mock(),
+        )
+        NinjaBlogApp._copy_cell_or_row(app, 1, "email")
+        self.assertEqual(len(copied), 1)
+        self.assertEqual(copied[0][0], "test@gmail.com")
+        self.assertIn("Gmail", copied[0][1])

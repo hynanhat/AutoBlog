@@ -174,13 +174,13 @@ class TestHiraganaRetryAndManualFallback(unittest.TestCase):
         runner._handle_manual_hiragana.assert_not_called()
 
         # Kiểm tra ghi nhận log thử lại
-        self.assertTrue(any("Nhập sai Hiragana (lần 1/3)" in m for m in self.log_messages))
-        self.assertTrue(any("Nhập sai Hiragana (lần 2/3)" in m for m in self.log_messages))
+        self.assertTrue(any(f"Nhập sai Hiragana (lần 1/{MAX_OCR_ATTEMPTS})" in m for m in self.log_messages))
+        self.assertTrue(any(f"Nhập sai Hiragana (lần 2/{MAX_OCR_ATTEMPTS})" in m for m in self.log_messages))
         self.assertTrue(any("Tạo blog thành công ở lần thử OCR thứ 3" in m for m in self.log_messages))
 
     def test_ocr_fails_3_times_and_switches_to_manual_input(self):
         """
-        Sau 3 lần OCR thất bại (nhập sai cả 3 lần):
+        Sau khi OCR thất bại tối đa MAX_OCR_ATTEMPTS lần:
         Tự động chuyển sang nhập tay với thời gian chờ 60 giây.
         """
         ocr_client = MagicMock(spec=HiraganaOCRClient)
@@ -195,7 +195,7 @@ class TestHiraganaRetryAndManualFallback(unittest.TestCase):
         )
         runner._human_delay = AsyncMock()
         runner._capture_hiragana_image = AsyncMock(return_value=b"fake_image")
-        runner._wait_for_make_submission = AsyncMock(return_value=False)  # Luôn sai cả 3 lần
+        runner._wait_for_make_submission = AsyncMock(return_value=False)  # Luôn sai
         runner._handle_manual_hiragana = AsyncMock(return_value=True)
 
         page, _, _, _ = self._create_mock_page()
@@ -203,12 +203,12 @@ class TestHiraganaRetryAndManualFallback(unittest.TestCase):
         success = run_coro(runner._process_hiragana_step(page, 1, "test1@gmail.com", "ninja.jp"))
 
         self.assertTrue(success)
-        self.assertEqual(ocr_hook.solve_ocr.call_count, 3)
+        self.assertEqual(ocr_hook.solve_ocr.call_count, MAX_OCR_ATTEMPTS)
         runner._handle_manual_hiragana.assert_called_once_with(
             page, 1, "test1@gmail.com", "ninja.jp", timeout=float(MANUAL_HIRAGANA_TIMEOUT)
         )
         self.assertTrue(
-            any("Đã thử OCR 3 lần không thành công. Chuyển sang nhập tay" in m for m in self.log_messages)
+            any(f"Đã thử OCR {MAX_OCR_ATTEMPTS} lần không thành công. Chuyển sang nhập tay" in m for m in self.log_messages)
         )
 
     def test_ocr_unreadable_refreshes_image_before_retry(self):

@@ -3,7 +3,9 @@ import csv
 import queue
 import threading
 from datetime import datetime
+import tkinter as tk
 from tkinter import filedialog, messagebox
+import webbrowser
 import customtkinter as ctk
 
 from hiragana_hook import ManualHiraganaHook, OCRHiraganaHook
@@ -355,11 +357,21 @@ class NinjaBlogApp(ctk.CTk):
         self.worker_thread.start()
 
     def _create_row(self, idx: int, email: str):
-        lbl_idx = ctk.CTkLabel(self.table_frame, text=str(idx), width=35)
-        lbl_mail = ctk.CTkLabel(self.table_frame, text=email, anchor="w")
-        lbl_dom = ctk.CTkLabel(self.table_frame, text="-", width=110)
-        lbl_status = ctk.CTkLabel(self.table_frame, text="Đang chờ", anchor="w")
-        lbl_url = ctk.CTkLabel(self.table_frame, text="", anchor="w")
+        lbl_idx = ctk.CTkLabel(
+            self.table_frame, text=str(idx), width=35, fg_color="transparent", corner_radius=4, cursor="hand2"
+        )
+        lbl_mail = ctk.CTkLabel(
+            self.table_frame, text=email, anchor="w", fg_color="transparent", corner_radius=4, cursor="hand2"
+        )
+        lbl_dom = ctk.CTkLabel(
+            self.table_frame, text="-", width=110, fg_color="transparent", corner_radius=4, cursor="hand2"
+        )
+        lbl_status = ctk.CTkLabel(
+            self.table_frame, text="Đang chờ", anchor="w", fg_color="transparent", corner_radius=4, cursor="hand2"
+        )
+        lbl_url = ctk.CTkLabel(
+            self.table_frame, text="", anchor="w", fg_color="transparent", corner_radius=4, cursor="hand2"
+        )
 
         lbl_idx.grid(row=idx, column=0, padx=4, pady=2)
         lbl_mail.grid(row=idx, column=1, padx=4, pady=2, sticky="ew")
@@ -367,13 +379,118 @@ class NinjaBlogApp(ctk.CTk):
         lbl_status.grid(row=idx, column=3, padx=4, pady=2, sticky="ew")
         lbl_url.grid(row=idx, column=4, padx=4, pady=2, sticky="ew")
 
+        all_widgets = (lbl_idx, lbl_mail, lbl_dom, lbl_status, lbl_url)
         self.results_rows[idx] = {
             "email": email,
             "domain": "-",
             "status": "Đang chờ",
             "url": "",
             "widgets": (lbl_dom, lbl_status, lbl_url),
+            "all_widgets": all_widgets,
         }
+
+        # Hiệu ứng hover nổi bật cả dòng khi rê chuột vào
+        def on_enter(_event):
+            for w in all_widgets:
+                try:
+                    w.configure(fg_color=("gray85", "gray25"))
+                except Exception:
+                    pass
+
+        def on_leave(_event):
+            for w in all_widgets:
+                try:
+                    w.configure(fg_color="transparent")
+                except Exception:
+                    pass
+
+        for w in all_widgets:
+            w.bind("<Enter>", on_enter)
+            w.bind("<Leave>", on_leave)
+            w.bind("<Button-3>", lambda e, i=idx: self._show_row_context_menu(e, i))
+            w.bind("<Button-2>", lambda e, i=idx: self._show_row_context_menu(e, i))
+            w.bind("<Double-Button-1>", lambda _e, i=idx: self._copy_entire_row(i))
+
+        # Click chuột trái:
+        # - Click vào Link Blog -> copy Link Blog (nếu có, hoặc copy cả dòng nếu chưa có)
+        # - Click vào Gmail -> copy Gmail
+        # - Click vào STT, Domain, Trạng thái -> copy toàn bộ dòng
+        lbl_url.bind("<Button-1>", lambda _e, i=idx: self._copy_cell_or_row(i, "url"))
+        lbl_mail.bind("<Button-1>", lambda _e, i=idx: self._copy_cell_or_row(i, "email"))
+        lbl_idx.bind("<Button-1>", lambda _e, i=idx: self._copy_entire_row(i))
+        lbl_dom.bind("<Button-1>", lambda _e, i=idx: self._copy_entire_row(i))
+        lbl_status.bind("<Button-1>", lambda _e, i=idx: self._copy_entire_row(i))
+
+    def _copy_to_clipboard(self, text: str, message: str = ""):
+        if not text:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            if message:
+                self.ui_queue.put(("log", f"[Đã sao chép] {message}: {text}"))
+        except Exception as exc:
+            self.ui_queue.put(("log", f"Lỗi sao chép: {exc}"))
+
+    def _flash_row(self, idx: int):
+        row = self.results_rows.get(idx)
+        if not row:
+            return
+        all_w = row.get("all_widgets", ())
+        for w in all_w:
+            try:
+                w.configure(fg_color=("#86efac", "#1e3a8a"))
+            except Exception:
+                pass
+        self.after(
+            250,
+            lambda: [
+                w.configure(fg_color="transparent")
+                for w in all_w
+                if hasattr(w, "winfo_exists") and w.winfo_exists()
+            ],
+        )
+
+    def _copy_entire_row(self, idx: int):
+        row = self.results_rows.get(idx)
+        if not row:
+            return
+        self._flash_row(idx)
+        text = f"{idx}\t{row.get('email', '')}\t{row.get('domain', '-')}\t{row.get('status', '')}\t{row.get('url', '')}".rstrip()
+        self._copy_to_clipboard(text, f"Dòng #{idx}")
+
+    def _copy_cell_or_row(self, idx: int, field: str):
+        row = self.results_rows.get(idx)
+        if not row:
+            return
+        val = (row.get(field) or "").strip()
+        if field == "url" and not val:
+            self._copy_entire_row(idx)
+            return
+        self._flash_row(idx)
+        label_map = {"url": f"Link Blog #{idx}", "email": f"Gmail #{idx}"}
+        self._copy_to_clipboard(val, label_map.get(field, f"Dòng #{idx}"))
+
+    def _show_row_context_menu(self, event, idx: int):
+        row = self.results_rows.get(idx)
+        if not row:
+            return
+        url = (row.get("url") or "").strip()
+        email = (row.get("email") or "").strip()
+
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label=f"📋 Sao chép toàn bộ dòng #{idx}", command=lambda: self._copy_entire_row(idx))
+        if url:
+            menu.add_command(label="🔗 Sao chép Link Blog", command=lambda: self._copy_cell_or_row(idx, "url"))
+            menu.add_command(label="🌐 Mở Link Blog trên trình duyệt", command=lambda: webbrowser.open(url))
+        else:
+            menu.add_command(label="🔗 Sao chép Link Blog (chưa có)", state="disabled")
+        menu.add_command(label=f"✉️ Sao chép Gmail ({email})", command=lambda: self._copy_cell_or_row(idx, "email"))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _run_async_worker(self, config: JobConfig, ocr_url: str | None):
         failure = None
@@ -493,7 +610,10 @@ class NinjaBlogApp(ctk.CTk):
                     lbl_dom, lbl_status, lbl_url = row["widgets"]
                     lbl_dom.configure(text=domain)
                     lbl_status.configure(text=status)
-                    lbl_url.configure(text=url)
+                    if url:
+                        lbl_url.configure(text=url, text_color=("#1d4ed8", "#60a5fa"))
+                    else:
+                        lbl_url.configure(text="", text_color=("gray10", "gray90"))
             elif kind == "log":
                 self.txt_log.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {payload}\n")
                 self.txt_log.see("end")
