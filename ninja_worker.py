@@ -228,6 +228,7 @@ class NinjaAutomationRunner:
         self.on_status = on_status
         self.on_log = on_log
         self._stop_requested = False
+        self._excluded_domain: str | None = None
 
     def request_stop(self):
         self._stop_requested = True
@@ -249,6 +250,10 @@ class NinjaAutomationRunner:
         await page.wait_for_timeout(delay_ms)
 
     async def run(self):
+        self._excluded_domain = "darumasangakoronda.com" if len(self.config.subdomain) > 9 else None
+        if self._excluded_domain:
+            self.on_log(f"Bỏ qua {self._excluded_domain} trong phiên này vì subdomain dài hơn 9 ký tự.")
+
         max_tabs = max(1, min(10, self.config.max_concurrent))
         semaphore = asyncio.Semaphore(max_tabs)
 
@@ -351,7 +356,7 @@ class NinjaAutomationRunner:
                 await account_input.blur()
                 await self._human_delay(page)
 
-                # Chọn tên miền tuần tự từ trên xuống (bỏ qua domain disabled)
+                # Chọn tên miền khả dụng theo thứ tự sau khi áp dụng bộ lọc của phiên.
                 selected_domain, domain_label = await self._select_domain_sequentially(page, idx)
                 await self._human_delay(page)
 
@@ -837,6 +842,10 @@ class NinjaAutomationRunner:
         for opt in options:
             val = (await opt.get_attribute("value")) or ""
             label = (await opt.inner_text()).strip()
+            if self._excluded_domain:
+                label_domain = re.split(r"[\s(（]", label, maxsplit=1)[0]
+                if self._excluded_domain in (val.strip().lstrip(".").lower(), label_domain.lstrip(".").lower()):
+                    continue
             is_disabled = await opt.is_disabled()
             if not val or "選択" in label or is_disabled:
                 continue
