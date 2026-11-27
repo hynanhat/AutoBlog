@@ -1,5 +1,0 @@
-# Ninja Blog Automation Tool (AutoBlog) + OCR Hiragana AI
-
-Ứng dụng Desktop tự động hóa toàn diện quy trình đăng nhập, khởi tạo blog và xuất bản bài viết HTML trên nền tảng Shinobi Blog (`ninja.co.jp`), tích hợp dịch vụ giải mã Captcha Hiragana tự động bằng mô hình AI Gemini (Flash / Flash-Lite) kết hợp OpenCV.
-
-Vui lòng xem chi tiết tài liệu đầy đủ tại tệp [README.md](file:///c:/Users/Admin/AutoBlog/README.md).

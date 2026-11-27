@@ -1,8 +1,10 @@
 import asyncio
 import csv
 import queue
+import sqlite3
 import threading
 from datetime import datetime
+from pathlib import Path
 from time import perf_counter
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -11,8 +13,16 @@ import customtkinter as ctk
 
 from hiragana_hook import ManualHiraganaHook, OCRHiraganaHook
 from ninja_worker import JobConfig, NinjaAutomationRunner, PUBLIC_POST_FOUND, PUBLICATION_UNCONFIRMED
+from ocr_cleanup import cleanup_ocr_images, cleanup_preference_file, save_cleanup_preference
 from ocr_client import HiraganaOCRClient, OCRConfig, ensure_ocr_server_running
 from parsers import parse_gmails, parse_posts_txt, validate_mapping
+from registration_tab import RegistrationTab
+from ui_style import (
+    ACCENT, ACCENT_HOVER, BANNER, BORDER, CANVAS, INK, MUTED, SELECTED, STRIPE,
+    SURFACE, TABLE_HEADER, bind_row_menu, card, empty_state, log_panel,
+    primary_button, scroll_panel, secondary_button, section_title, show_row_menu,
+    stop_button, textbox,
+)
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -22,8 +32,12 @@ class NinjaBlogApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Ninja Blog Automation v1.0.0")
-        self.geometry("1220x780")
-        self.minsize(1060, 700)
+        self.configure(fg_color=CANVAS)
+        scale = self._get_window_scaling()
+        width = min(1380, int(self.winfo_screenwidth() / scale) - 60)
+        height = min(880, int(self.winfo_screenheight() / scale) - 100)
+        self.geometry(f"{width}x{height}")
+        self.minsize(980, 640)
 
         self.posts_map = {}
         self.results_rows = {}
@@ -32,29 +46,79 @@ class NinjaBlogApp(ctk.CTk):
         self.runner: NinjaAutomationRunner | None = None
         self.stop_requested: bool = False
         self.worker_thread: threading.Thread | None = None
+        self._closing = False
+        self.cleanup_on_exit = ctk.BooleanVar(self, value=cleanup_preference_file().is_file())
 
         self._build_layout()
-        self.after(150, self._poll_ui_queue)
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+        self._poll_after_id = self.after(150, self._poll_ui_queue)
 
     def _build_layout(self):
-        self.grid_columnconfigure(0, weight=4, minsize=390)
-        self.grid_columnconfigure(1, weight=6, minsize=620)
-        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=0, column=0, padx=18, pady=(14, 12), sticky="ew")
+        top.grid_columnconfigure(1, weight=1)
+        active_tab = self._active_tab = tk.StringVar(self, value="Tạo blog")
+        self.tabview = ctk.CTkSegmentedButton(
+            top, values=["Tạo blog", "Đăng ký tài khoản"], variable=active_tab,
+            width=320, height=37, corner_radius=8, dynamic_resizing=False,
+            fg_color=BORDER, selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER, unselected_color=("#4b607b", "#344862"),
+            unselected_hover_color=("#385472", "#425979"),
+            text_color="white", font=("Segoe UI", 13, "bold"),
+        )
+        self.tabview.grid(row=0, column=0, sticky="w")
+        blog_toolbar = ctk.CTkFrame(top, fg_color="transparent")
+        registration_toolbar = ctk.CTkFrame(top, fg_color="transparent")
+
+        tab_blog = ctk.CTkFrame(self, fg_color="transparent")
+        tab_blog.grid_columnconfigure(0, weight=4, minsize=365)
+        tab_blog.grid_columnconfigure(1, weight=6, minsize=570)
+        tab_blog.grid_rowconfigure(0, weight=1)
+        self.registration_tab = RegistrationTab(self, toolbar_parent=registration_toolbar)
+
+        tabs = {
+            "Tạo blog": (tab_blog, blog_toolbar),
+            "Đăng ký tài khoản": (self.registration_tab, registration_toolbar),
+        }
+
+        def select_tab(*_):
+            selected = active_tab.get()
+            for name, (panel, toolbar) in tabs.items():
+                if name == selected:
+                    panel.grid(row=1, column=0, padx=18, pady=(0, 16), sticky="nsew")
+                    toolbar.grid(row=0, column=1, sticky="e")
+                else:
+                    panel.grid_remove()
+                    toolbar.grid_remove()
+
+        active_tab.trace_add("write", select_tab)
+        self.tabview.set("Tạo blog")
+        select_tab()
 
         # ================= CỘT TRÁI: CẤU HÌNH =================
-        left = ctk.CTkScrollableFrame(self, label_text="Cấu hình chiến dịch")
-        left.grid(row=0, column=0, padx=(12, 6), pady=12, sticky="nsew")
+        left = scroll_panel(tab_blog, label_text="Cấu hình chiến dịch")
+        left.grid(row=0, column=0, padx=(0, 7), sticky="nsew")
         left.grid_columnconfigure(0, weight=1)
 
         # 1. Danh sách Gmail
+        gmail_header = ctk.CTkFrame(left, fg_color="transparent")
+        gmail_header.grid(row=0, column=0, padx=8, pady=(4, 3), sticky="ew")
+        gmail_header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            gmail_header, text="Danh sách Gmail", anchor="w", text_color=INK, font=("Segoe UI", 14, "bold")
+        ).grid(row=0, column=0, sticky="w")
         self.lbl_gmail_count = ctk.CTkLabel(
-            left, text="Danh sách Gmail (0 / 101)", anchor="w", font=("", 13, "bold")
+            gmail_header, text="0 / 101", anchor="e", text_color=MUTED, font=("Segoe UI", 13, "bold")
         )
-        self.lbl_gmail_count.grid(row=0, column=0, padx=8, pady=(6, 2), sticky="ew")
+        self.lbl_gmail_count.grid(row=0, column=1, sticky="e")
 
-        self.txt_gmails = ctk.CTkTextbox(left, height=130)
+        self.txt_gmails = textbox(left, height=125, placeholder="Mỗi dòng một địa chỉ Gmail")
         self.txt_gmails.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="ew")
         self.txt_gmails.bind("<KeyRelease>", self._update_gmail_counter)
+        self.txt_gmails.bind("<<Paste>>", lambda _event: self.after_idle(self._update_gmail_counter))
 
         # Mật khẩu dùng chung + Số luồng
         row_pw = ctk.CTkFrame(left, fg_color="transparent")
@@ -62,31 +126,41 @@ class NinjaBlogApp(ctk.CTk):
         row_pw.grid_columnconfigure(0, weight=3)
         row_pw.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(row_pw, text="Mật khẩu chung:", anchor="w").grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(row_pw, text="Số luồng (1–10):", anchor="w").grid(row=0, column=1, padx=(8, 0), sticky="w")
+        ctk.CTkLabel(row_pw, text="Mật khẩu chung", anchor="w", text_color=INK).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(row_pw, text="Số phiên (1–10)", anchor="w", text_color=INK).grid(
+            row=0, column=1, padx=(8, 0), sticky="w"
+        )
 
-        self.entry_password = ctk.CTkEntry(row_pw, show="*", placeholder_text="Nhập mật khẩu dùng chung...")
+        self.entry_password = ctk.CTkEntry(
+            row_pw, show="*", placeholder_text="Nhập mật khẩu chung", border_color=BORDER, height=32
+        )
         self.entry_password.grid(row=1, column=0, sticky="ew")
 
-        self.entry_concurrency = ctk.CTkEntry(row_pw, width=90)
+        self.entry_concurrency = ctk.CTkEntry(row_pw, width=104, border_color=BORDER, height=32)
         self.entry_concurrency.insert(0, "5")
         self.entry_concurrency.grid(row=1, column=1, padx=(8, 0), sticky="ew")
 
         # 2. Thiết lập Blog
-        ctk.CTkLabel(left, text="Thiết lập Blog", anchor="w", font=("", 13, "bold")).grid(
-            row=3, column=0, padx=8, pady=(12, 2), sticky="ew"
+        section_title(left, "Thiết lập blog").grid(row=3, column=0, padx=8, pady=(12, 2), sticky="ew")
+        blog_fields = ctk.CTkFrame(left, fg_color="transparent")
+        blog_fields.grid(row=4, column=0, padx=8, pady=(0, 4), sticky="ew")
+        blog_fields.grid_columnconfigure((0, 1), weight=1, uniform="blog_fields")
+        ctk.CTkLabel(blog_fields, text="Tên blog", anchor="w", text_color=INK).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(blog_fields, text="Subdomain", anchor="w", text_color=INK).grid(
+            row=0, column=1, padx=(8, 0), sticky="w"
         )
-        self.entry_blog_name = ctk.CTkEntry(left, placeholder_text="Tên blog (ツールの名前)")
-        self.entry_blog_name.grid(row=4, column=0, padx=8, pady=4, sticky="ew")
-
-        self.entry_subdomain = ctk.CTkEntry(left, placeholder_text="Subdomain (VD: myseoblog88)")
-        self.entry_subdomain.grid(row=5, column=0, padx=8, pady=4, sticky="ew")
+        self.entry_blog_name = ctk.CTkEntry(blog_fields, border_color=BORDER, height=32)
+        self.entry_blog_name.grid(row=1, column=0, sticky="ew")
+        self.entry_subdomain = ctk.CTkEntry(blog_fields, border_color=BORDER, height=32)
+        self.entry_subdomain.grid(row=1, column=1, padx=(8, 0), sticky="ew")
 
         # 3. Nội dung bài viết HTML
-        ctk.CTkLabel(left, text="Nội dung bài viết (HTML)", anchor="w", font=("", 13, "bold")).grid(
+        section_title(left, "Nội dung bài viết (HTML)").grid(
             row=6, column=0, padx=8, pady=(12, 2), sticky="ew"
         )
-        self.entry_post_title = ctk.CTkEntry(left, placeholder_text="Tiêu đề bài viết mặc định (タイトル)")
+        self.entry_post_title = ctk.CTkEntry(
+            left, placeholder_text="Tiêu đề bài viết mặc định", border_color=BORDER, height=32
+        )
         self.entry_post_title.grid(row=7, column=0, padx=8, pady=4, sticky="ew")
 
         self.html_mode_var = ctk.IntVar(value=1)
@@ -95,24 +169,26 @@ class NinjaBlogApp(ctk.CTk):
 
         ctk.CTkRadioButton(
             mode_frame,
-            text="Dùng chung 1 nội dung HTML cho tất cả blog",
+            text="Dùng chung HTML",
+            text_color=INK,
             variable=self.html_mode_var,
             value=1,
             command=self._toggle_html_mode,
-        ).pack(anchor="w", pady=2)
+        ).pack(side="left", padx=(0, 12), pady=2)
         ctk.CTkRadioButton(
             mode_frame,
-            text="Nạp nội dung riêng cho từng blog từ tệp TXT",
+            text="Nạp từ tệp TXT",
+            text_color=INK,
             variable=self.html_mode_var,
             value=2,
             command=self._toggle_html_mode,
-        ).pack(anchor="w", pady=2)
+        ).pack(side="left", pady=2)
 
         # Frame Chế độ 1
         self.frame_mode1 = ctk.CTkFrame(left, fg_color="transparent")
         self.frame_mode1.grid(row=9, column=0, padx=8, pady=4, sticky="ew")
         self.frame_mode1.grid_columnconfigure(0, weight=1)
-        self.txt_shared_html = ctk.CTkTextbox(self.frame_mode1, height=130)
+        self.txt_shared_html = textbox(self.frame_mode1, height=132, placeholder="Dán nội dung HTML tại đây")
         self.txt_shared_html.grid(row=0, column=0, sticky="ew")
 
         # Frame Chế độ 2
@@ -128,7 +204,7 @@ class NinjaBlogApp(ctk.CTk):
         self.lbl_txt_status.grid(row=1, column=0, pady=2, sticky="ew")
 
         # 4. Tự động hóa giải Hiragana (OCR)
-        ctk.CTkLabel(left, text="Tự động hóa giải Hiragana (OCR)", anchor="w", font=("", 13, "bold")).grid(
+        section_title(left, "Xác thực Hiragana").grid(
             row=10, column=0, padx=8, pady=(14, 2), sticky="ew"
         )
         self.use_ocr_var = ctk.BooleanVar(value=True)
@@ -160,71 +236,85 @@ class NinjaBlogApp(ctk.CTk):
         )
         self.btn_check_ocr.grid(row=2, column=0, pady=4, sticky="ew")
 
+        ctk.CTkCheckBox(
+            left, text="Dọn ảnh Hiragana khi thoát (cả hai tab)", variable=self.cleanup_on_exit,
+            command=self._save_cleanup_preference,
+        ).grid(row=13, column=0, padx=8, pady=(8, 10), sticky="w")
+
         # ================= CỘT PHẢI: ĐIỀU KHIỂN & KẾT QUẢ =================
-        right = ctk.CTkFrame(self)
-        right.grid(row=0, column=1, padx=(6, 12), pady=12, sticky="nsew")
+        right = ctk.CTkFrame(tab_blog, fg_color="transparent")
+        right.grid(row=0, column=1, padx=(7, 0), sticky="nsew")
         right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(2, weight=1)
+        right.grid_rowconfigure(1, weight=3, minsize=210)
+        right.grid_rowconfigure(2, weight=2, minsize=150)
 
         # Thanh nút điều khiển
-        ctrl = ctk.CTkFrame(right)
-        ctrl.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
-
-        self.btn_start = ctk.CTkButton(ctrl, text="Bắt đầu chạy", fg_color="#1f6aa5", command=self._start_job)
-        self.btn_start.pack(side="left", padx=6, pady=8)
-
-        self.btn_stop = ctk.CTkButton(
-            ctrl, text="Dừng lại", fg_color="#b33a3a", state="disabled", command=self._stop_job
+        self.btn_export = secondary_button(blog_toolbar, text="Xuất CSV", width=112, command=self._export_csv)
+        self.btn_export.pack(side="left", padx=(0, 8))
+        self.btn_stop = stop_button(
+            blog_toolbar, text="Dừng lại", width=112, state="disabled", command=self._stop_job
         )
-        self.btn_stop.pack(side="left", padx=6, pady=8)
-
-        self.btn_export = ctk.CTkButton(ctrl, text="Xuất kết quả (.csv)", command=self._export_csv)
-        self.btn_export.pack(side="right", padx=6, pady=8)
+        self.btn_stop.pack(side="left", padx=(0, 8))
+        self.btn_start = primary_button(blog_toolbar, text="Bắt đầu chạy", width=145, command=self._start_job)
+        self.btn_start.pack(side="left")
 
         # Thanh điều phối Hiragana (tương phản rõ trên cả Light & Dark Mode)
-        self.hiragana_bar = ctk.CTkFrame(right, fg_color=("gray88", "#2b2b2b"))
-        self.hiragana_bar.grid(row=1, column=0, padx=10, pady=(0, 8), sticky="ew")
+        self.hiragana_bar = card(right, fg_color=BANNER)
+        self.hiragana_bar.grid(row=0, column=0, pady=(0, 12), sticky="ew")
+        self.hiragana_bar.grid_columnconfigure(0, weight=1)
         self.lbl_hiragana_wait = ctk.CTkLabel(
             self.hiragana_bar,
-            text="Xác thực Hiragana: Sẵn sàng (tự tạm dừng khi cần nhập ký tự).",
-            text_color=("gray15", "gray90"),
+            text="Xác thực Hiragana: Sẵn sàng",
+            font=("Segoe UI", 14, "bold"), text_color=INK,
             anchor="w",
             justify="left",
-            wraplength=375,
+            wraplength=335,
         )
-        self.lbl_hiragana_wait.pack(side="left", padx=10, pady=8)
-        self.btn_hiragana_done = ctk.CTkButton(
+        self.lbl_hiragana_wait.grid(row=0, column=0, padx=14, pady=(8, 0), sticky="ew")
+        self.lbl_hiragana_hint = ctk.CTkLabel(
+            self.hiragana_bar, text="Ứng dụng sẽ tạm dừng khi cần nhập ký tự.",
+            text_color=MUTED, anchor="w", justify="left", wraplength=330,
+        )
+        self.lbl_hiragana_hint.grid(row=1, column=0, padx=14, pady=(0, 8), sticky="ew")
+        self.btn_hiragana_done = secondary_button(
             self.hiragana_bar, text="Đã gửi trên Chromium", state="disabled", command=self._confirm_manual_hiragana
         )
-        self.btn_hiragana_done.pack(side="right", padx=10, pady=8)
+        self.btn_hiragana_done.grid(row=0, column=1, rowspan=2, padx=14, pady=10)
 
         # Bảng trạng thái
-        self.table_frame = ctk.CTkScrollableFrame(right, label_text="Tiến độ xử lý")
-        self.table_frame.grid(row=2, column=0, padx=10, pady=(0, 8), sticky="nsew")
-        self.table_frame.grid_columnconfigure(1, weight=2)
-        self.table_frame.grid_columnconfigure(3, weight=2)
-        self.table_frame.grid_columnconfigure(4, weight=3)
+        progress = card(right)
+        progress.grid(row=1, column=0, pady=(0, 12), sticky="nsew")
+        progress.grid_columnconfigure(0, weight=1)
+        progress.grid_rowconfigure(1, weight=1)
+        section_title(progress, "Tiến độ tạo blog").grid(row=0, column=0, padx=14, pady=(10, 6), sticky="w")
+        table = card(progress, corner_radius=7)
+        table.grid(row=1, column=0, padx=12, pady=(0, 12), sticky="nsew")
+        table.grid_columnconfigure(0, weight=1)
+        table.grid_rowconfigure(0, weight=1)
+        self.table_frame = ctk.CTkScrollableFrame(
+            table, fg_color=SURFACE, corner_radius=7, scrollbar_button_color=BORDER,
+        )
+        self.table_frame.grid(row=0, column=0, padx=1, pady=1, sticky="nsew")
+        for column, (width, weight) in enumerate(((34, 0), (122, 2), (82, 1), (112, 2), (128, 3))):
+            self.table_frame.grid_columnconfigure(column, minsize=width, weight=weight)
         self._render_table_header()
+        self._empty_results = empty_state(table, "Chưa có kết quả", "Thêm Gmail và bấm Bắt đầu chạy.")
+        self._empty_results.place(relx=0.5, rely=0.55, anchor="center")
 
         # Nhật ký chạy phía dưới
-        self.txt_log = ctk.CTkTextbox(right, height=115)
-        self.txt_log.grid(row=3, column=0, padx=10, pady=(0, 10), sticky="ew")
+        logs, self.txt_log = log_panel(right)
+        logs.grid(row=2, column=0, sticky="nsew")
 
     def _render_table_header(self):
-        headers = [("#", 35), ("Gmail", 0), ("Domain", 110), ("Trạng thái", 0), ("Link Blog", 0)]
-        for col, (text, width) in enumerate(headers):
-            lbl = ctk.CTkLabel(
-                self.table_frame,
-                text=text,
-                width=width if width else 0,
-                anchor="w" if col in (1, 3, 4) else "center",
-                font=("", 12, "bold"),
-            )
-            lbl.grid(row=0, column=col, padx=4, pady=(2, 6), sticky="ew")
+        for column, text in enumerate(("#", "Gmail", "Domain", "Trạng thái", "Link blog")):
+            ctk.CTkLabel(
+                self.table_frame, text=text, width=0, height=34, padx=6, fg_color=TABLE_HEADER,
+                anchor="center" if column == 0 else "w", text_color=INK, font=("Segoe UI", 12, "bold"),
+            ).grid(row=0, column=column, sticky="ew")
 
     def _update_gmail_counter(self, _event=None):
         gmails, _ = parse_gmails(self.txt_gmails.get("1.0", "end"))
-        self.lbl_gmail_count.configure(text=f"Danh sách Gmail ({len(gmails)} / 101)")
+        self.lbl_gmail_count.configure(text=f"{len(gmails)} / 101")
 
     def _toggle_html_mode(self):
         if self.html_mode_var.get() == 1:
@@ -348,9 +438,9 @@ class NinjaBlogApp(ctk.CTk):
                 )
                 return
 
-        for widget in self.table_frame.winfo_children():
-            widget.destroy()
-        self._render_table_header()
+        for row in self.results_rows.values():
+            for widget in row["all_widgets"]:
+                widget.destroy()
         self.results_rows.clear()
         for idx, email in enumerate(gmails, start=1):
             self._create_row(idx, email)
@@ -377,69 +467,27 @@ class NinjaBlogApp(ctk.CTk):
         self.worker_thread.start()
 
     def _create_row(self, idx: int, email: str):
-        lbl_idx = ctk.CTkLabel(
-            self.table_frame, text=str(idx), width=35, fg_color="transparent", corner_radius=4, cursor="hand2"
-        )
-        lbl_mail = ctk.CTkLabel(
-            self.table_frame, text=email, anchor="w", fg_color="transparent", corner_radius=4, cursor="hand2"
-        )
-        lbl_dom = ctk.CTkLabel(
-            self.table_frame, text="-", width=110, fg_color="transparent", corner_radius=4, cursor="hand2"
-        )
-        lbl_status = ctk.CTkLabel(
-            self.table_frame, text="Đang chờ", anchor="w", fg_color="transparent", corner_radius=4, cursor="hand2"
-        )
-        lbl_url = ctk.CTkLabel(
-            self.table_frame, text="", anchor="w", fg_color="transparent", corner_radius=4, cursor="hand2"
-        )
-
-        lbl_idx.grid(row=idx, column=0, padx=4, pady=2)
-        lbl_mail.grid(row=idx, column=1, padx=4, pady=2, sticky="ew")
-        lbl_dom.grid(row=idx, column=2, padx=4, pady=2)
-        lbl_status.grid(row=idx, column=3, padx=4, pady=2, sticky="ew")
-        lbl_url.grid(row=idx, column=4, padx=4, pady=2, sticky="ew")
-
-        all_widgets = (lbl_idx, lbl_mail, lbl_dom, lbl_status, lbl_url)
+        self._empty_results.place_forget()
+        background = STRIPE if idx % 2 == 0 else SURFACE
+        labels = []
+        cells = ((str(idx), 0), (email, 126), ("-", 78), ("Đang chờ", 112), ("", 145))
+        for column, (value, wrap) in enumerate(cells):
+            label = ctk.CTkLabel(
+                self.table_frame, text=value, width=0, height=34, wraplength=wrap, padx=6,
+                anchor="center" if column == 0 else "w", justify="left",
+                fg_color=background, text_color=INK, cursor="hand2",
+            )
+            label.grid(row=idx, column=column, sticky="nsew")
+            labels.append(label)
         self.results_rows[idx] = {
             "email": email,
             "domain": "-",
             "status": "Đang chờ",
             "url": "",
-            "widgets": (lbl_dom, lbl_status, lbl_url),
-            "all_widgets": all_widgets,
+            "widgets": labels[2:],
+            "all_widgets": labels,
         }
-
-        # Hiệu ứng hover nổi bật cả dòng khi rê chuột vào
-        def on_enter(_event):
-            for w in all_widgets:
-                try:
-                    w.configure(fg_color=("gray85", "gray25"))
-                except Exception:
-                    pass
-
-        def on_leave(_event):
-            for w in all_widgets:
-                try:
-                    w.configure(fg_color="transparent")
-                except Exception:
-                    pass
-
-        for w in all_widgets:
-            w.bind("<Enter>", on_enter)
-            w.bind("<Leave>", on_leave)
-            w.bind("<Button-3>", lambda e, i=idx: self._show_row_context_menu(e, i))
-            w.bind("<Button-2>", lambda e, i=idx: self._show_row_context_menu(e, i))
-            w.bind("<Double-Button-1>", lambda _e, i=idx: self._copy_entire_row(i))
-
-        # Click chuột trái:
-        # - Click vào Link Blog -> copy Link Blog (nếu có, hoặc copy cả dòng nếu chưa có)
-        # - Click vào Gmail -> copy Gmail
-        # - Click vào STT, Domain, Trạng thái -> copy toàn bộ dòng
-        lbl_url.bind("<Button-1>", lambda _e, i=idx: self._copy_cell_or_row(i, "url"))
-        lbl_mail.bind("<Button-1>", lambda _e, i=idx: self._copy_cell_or_row(i, "email"))
-        lbl_idx.bind("<Button-1>", lambda _e, i=idx: self._copy_entire_row(i))
-        lbl_dom.bind("<Button-1>", lambda _e, i=idx: self._copy_entire_row(i))
-        lbl_status.bind("<Button-1>", lambda _e, i=idx: self._copy_entire_row(i))
+        bind_row_menu(labels, lambda event: self._show_row_context_menu(event, idx))
 
     def _copy_to_clipboard(self, text: str, message: str = ""):
         if not text:
@@ -447,9 +495,8 @@ class NinjaBlogApp(ctk.CTk):
         try:
             self.clipboard_clear()
             self.clipboard_append(text)
-            self.update()
             if message:
-                self.ui_queue.put(("log", f"[Đã sao chép] {message}: {text}"))
+                self.ui_queue.put(("log", f"[Đã sao chép] {message}"))
         except Exception as exc:
             self.ui_queue.put(("log", f"Lỗi sao chép: {exc}"))
 
@@ -460,13 +507,13 @@ class NinjaBlogApp(ctk.CTk):
         all_w = row.get("all_widgets", ())
         for w in all_w:
             try:
-                w.configure(fg_color=("#86efac", "#1e3a8a"))
+                w.configure(fg_color=SELECTED)
             except Exception:
                 pass
         self.after(
             250,
             lambda: [
-                w.configure(fg_color="transparent")
+                w.configure(fg_color=STRIPE if idx % 2 == 0 else SURFACE)
                 for w in all_w
                 if hasattr(w, "winfo_exists") and w.winfo_exists()
             ],
@@ -477,16 +524,18 @@ class NinjaBlogApp(ctk.CTk):
         if not row:
             return
         self._flash_row(idx)
-        text = f"{idx}\t{row.get('email', '')}\t{row.get('domain', '-')}\t{row.get('status', '')}\t{row.get('url', '')}".rstrip()
+        status = row.get("status", "")
+        if status == "DONE":
+            status = "Hoàn tất"
+        text = f"{idx}\t{row.get('email', '')}\t{row.get('domain', '-')}\t{status}\t{row.get('url', '')}".rstrip()
         self._copy_to_clipboard(text, f"Dòng #{idx}")
 
-    def _copy_cell_or_row(self, idx: int, field: str):
+    def _copy_cell(self, idx: int, field: str):
         row = self.results_rows.get(idx)
         if not row:
             return
         val = (row.get(field) or "").strip()
-        if field == "url" and not val:
-            self._copy_entire_row(idx)
+        if not val:
             return
         self._flash_row(idx)
         label_map = {"url": f"Link Blog #{idx}", "email": f"Gmail #{idx}"}
@@ -497,20 +546,12 @@ class NinjaBlogApp(ctk.CTk):
         if not row:
             return
         url = (row.get("url") or "").strip()
-        email = (row.get("email") or "").strip()
-
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label=f"📋 Sao chép toàn bộ dòng #{idx}", command=lambda: self._copy_entire_row(idx))
+        options = [("Sao chép Gmail", lambda: self._copy_cell(idx, "email"))]
         if url:
-            menu.add_command(label="🔗 Sao chép Link Blog", command=lambda: self._copy_cell_or_row(idx, "url"))
-            menu.add_command(label="🌐 Mở Link Blog trên trình duyệt", command=lambda: webbrowser.open(url))
-        else:
-            menu.add_command(label="🔗 Sao chép Link Blog (chưa có)", state="disabled")
-        menu.add_command(label=f"✉️ Sao chép Gmail ({email})", command=lambda: self._copy_cell_or_row(idx, "email"))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+            options.append(("Sao chép link blog", lambda: self._copy_cell(idx, "url")))
+            options.append(("Mở link blog trên trình duyệt", lambda: webbrowser.open(url)))
+        options.append((f"Sao chép toàn bộ dòng #{idx}", lambda: self._copy_entire_row(idx)))
+        return show_row_menu(self, event, options)
 
     def _run_async_worker(self, config: JobConfig, ocr_url: str | None):
         failure = None
@@ -605,33 +646,31 @@ class NinjaBlogApp(ctk.CTk):
         if self.hiragana_waiters:
             first_idx = next(iter(self.hiragana_waiters))
             email = self.results_rows[first_idx]["email"]
-            self.lbl_hiragana_wait.configure(
-                text=f"Nhập thủ công cho [{first_idx}] {email}\n"
-                     "Trong Chromium, nhập Hiragana và bấm 作成する để gửi. "
-                     "Khi trang chấp nhận, bấm “Đã gửi trên Chromium” ở đây."
+            self.lbl_hiragana_wait.configure(text=f"Nhập thủ công cho [{first_idx}] {email}")
+            self.lbl_hiragana_hint.configure(
+                text="Nhập Hiragana và bấm 作成する trong Chromium, sau đó xác nhận tại đây."
             )
             self.btn_hiragana_done.configure(state="normal")
         else:
-            self.lbl_hiragana_wait.configure(
-                text="Xác thực Hiragana: Sẵn sàng (tự tạm dừng khi cần nhập ký tự)."
-            )
+            self.lbl_hiragana_wait.configure(text="Xác thực Hiragana: Sẵn sàng")
+            self.lbl_hiragana_hint.configure(text="Ứng dụng sẽ tạm dừng khi cần nhập ký tự.")
             self.btn_hiragana_done.configure(state="disabled")
 
     def _handle_ui_event(self, kind, payload):
         if kind == "status":
-            idx, _email, domain, status, url = payload
+            idx, email, domain, status, url = payload
             row = self.results_rows.get(idx)
-            if row:
+            if row and row["email"] == email:
+                lbl_dom, lbl_status, lbl_url = row["widgets"]
+                if row["domain"] != domain:
+                    lbl_dom.configure(text=domain)
+                if row["status"] != status:
+                    lbl_status.configure(text="Hoàn tất" if status == "DONE" else status)
+                if row["url"] != url:
+                    lbl_url.configure(text=url, text_color=("#155bc2", "#93c1ff") if url else INK)
                 row["domain"] = domain
                 row["status"] = status
                 row["url"] = url
-                lbl_dom, lbl_status, lbl_url = row["widgets"]
-                lbl_dom.configure(text=domain)
-                lbl_status.configure(text=status)
-                if url:
-                    lbl_url.configure(text=url, text_color=("#1d4ed8", "#60a5fa"))
-                else:
-                    lbl_url.configure(text="", text_color=("gray10", "gray90"))
         elif kind == "hiragana_wait":
             acc_idx, _email, loop, fut = payload
             self.hiragana_waiters[acc_idx] = (loop, fut)
@@ -676,7 +715,7 @@ class NinjaBlogApp(ctk.CTk):
 
         flush_logs()
         delay_ms = 150 if self.ui_queue.empty() else 10
-        self.after(delay_ms, self._poll_ui_queue)
+        self._poll_after_id = self.after(delay_ms, self._poll_ui_queue)
 
     def _finish_job(self, failure: str | None):
         self.runner = None
@@ -717,18 +756,74 @@ class NinjaBlogApp(ctk.CTk):
             self.runner.request_stop()
 
     def _export_csv(self):
-        if not self.results_rows:
-            messagebox.showinfo("Trống", "Chưa có dữ liệu kết quả để xuất.")
+        blog_urls = [
+            row["url"]
+            for _, row in sorted(self.results_rows.items())
+            if row["url"]
+        ]
+        if not blog_urls:
+            messagebox.showinfo("Chưa có URL blog", "Chưa có URL blog đã tạo để xuất.", parent=self)
             return
-        save_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("Tệp CSV", "*.csv")],
+            initialfile="url-blog-da-tao.csv", parent=self,
+        )
         if not save_path:
             return
-        with open(save_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(["STT", "Gmail", "Domain", "Trạng thái", "Link Blog"])
-            for idx, r in sorted(self.results_rows.items()):
-                writer.writerow([idx, r["email"], r["domain"], r["status"], r["url"]])
-        messagebox.showinfo("Đã xuất", f"Đã lưu kết quả ra tệp:\n{save_path}")
+        try:
+            with open(save_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["URL"])
+                writer.writerows((url,) for url in blog_urls)
+        except OSError as exc:
+            messagebox.showerror("Không xuất được CSV", str(exc), parent=self)
+            return
+        messagebox.showinfo("Đã xuất CSV", f"Đã lưu {len(blog_urls)} URL blog vào\n{save_path}", parent=self)
+
+    def _save_cleanup_preference(self):
+        enabled = self.cleanup_on_exit.get()
+        try:
+            save_cleanup_preference(enabled)
+        except OSError:
+            self.cleanup_on_exit.set(not enabled)
+            messagebox.showerror("Không lưu được tùy chọn", "Không thể lưu cài đặt dọn ảnh.", parent=self)
+
+    def _on_closing(self):
+        if self._closing:
+            return
+        self._closing = True
+        self.stop_requested = True
+        poll_id = getattr(self, "_poll_after_id", None)
+        if poll_id is not None:
+            try:
+                self.after_cancel(poll_id)
+            except Exception:
+                pass
+            self._poll_after_id = None
+        if self.runner:
+            self.runner.request_stop()
+        try:
+            registration_stopped = self.registration_tab.shutdown()
+            if self.cleanup_on_exit.get():
+                self._clean_images_on_exit(registration_stopped)
+        finally:
+            self.destroy()
+
+    def _clean_images_on_exit(self, registration_stopped: bool):
+        worker = self.worker_thread
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=2)
+        if not registration_stopped or (worker is not None and worker.is_alive()):
+            messagebox.showinfo(
+                "Dọn ảnh Hiragana", "Ảnh được giữ lại vì phiên làm việc vẫn đang dừng.", parent=self,
+            )
+            return
+        try:
+            cleanup_ocr_images(Path(__file__).resolve().parent)
+        except (OSError, sqlite3.Error):
+            messagebox.showwarning(
+                "Dọn ảnh Hiragana", "Một số ảnh chưa dọn được. AutoBlog sẽ thử lại ở lần thoát sau.", parent=self,
+            )
 
 
 if __name__ == "__main__":

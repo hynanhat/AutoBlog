@@ -45,10 +45,31 @@ class OCRJobFailedError(OCRError):
     pass
 
 
+DEFAULT_OCR_URL = "http://127.0.0.1:8000"
+
+
+def resolve_default_ocr_url(env_file: Optional[Path] = None) -> str:
+    """Lấy URL OCR Server từ biến môi trường hoặc tệp .env, mặc định http://127.0.0.1:8000."""
+    env_url = os.getenv("OCR_HIRAGANA_URL", "").strip()
+    if env_url:
+        return env_url.rstrip("/")
+    target_env = env_file if env_file is not None else Path(__file__).resolve().parent / ".env"
+    if target_env.is_file():
+        try:
+            from dotenv import dotenv_values
+
+            val = (dotenv_values(target_env).get("OCR_HIRAGANA_URL") or "").strip()
+            if val:
+                return val.rstrip("/")
+        except Exception:
+            pass
+    return DEFAULT_OCR_URL
+
+
 @dataclass
 class OCRConfig:
     """Cấu hình kết nối dịch vụ OCR."""
-    base_url: str = "http://127.0.0.1:8000"
+    base_url: str = DEFAULT_OCR_URL
     inbox_dir: Optional[Path] = None
     state_file: Path = Path("ocr_cursor.json")
     poll_interval: float = 1.0
@@ -665,6 +686,7 @@ def ensure_ocr_server_running(
         Path(sys.executable),
     ]
 
+    no_window_flag = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
     selected_python = None
     for cand in python_candidates:
         if cand.is_file():
@@ -673,6 +695,7 @@ def ensure_ocr_server_running(
                     [str(cand), "-c", "import uvicorn; import starlette"],
                     capture_output=True,
                     timeout=2,
+                    creationflags=no_window_flag,
                 )
                 if res.returncode == 0:
                     selected_python = cand
@@ -689,16 +712,36 @@ def ensure_ocr_server_running(
     if selected_python is None:
         return False, f"Không tìm thấy Python phù hợp để chạy OCR server tại {ocr_dir}."
 
-    # Tự động khởi chạy tiến trình server.py
+    launch_python = selected_python
+    if sys.platform == "win32":
+        pythonw = selected_python.with_name("pythonw.exe")
+        if pythonw.is_file():
+            launch_python = pythonw
+
+    # Tự động khởi chạy tiến trình server.py chạy ngầm (không hiện cửa sổ hay đẩy log ra console chính)
+    log_handle = None
     try:
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        try:
+            log_path = ocr_dir / "inbox" / ".ocr-state" / "server.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_handle = open(log_path, "w", encoding="utf-8")
+        except OSError:
+            log_handle = None
+        output_target = log_handle if log_handle is not None else subprocess.DEVNULL
         subprocess.Popen(
-            [str(selected_python), str(server_py)],
+            [str(launch_python), str(server_py)],
             cwd=str(ocr_dir),
-            creationflags=flags,
+            stdin=subprocess.DEVNULL,
+            stdout=output_target,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            creationflags=no_window_flag,
         )
     except Exception as exc:
         return False, f"Không thể tự khởi động OCR Server: {exc}"
+    finally:
+        if log_handle is not None:
+            log_handle.close()
 
     # Chờ server khởi động
     deadline = time.time() + timeout

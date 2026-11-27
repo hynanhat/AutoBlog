@@ -155,6 +155,60 @@ class PublicationTests(unittest.IsolatedAsyncioTestCase):
                          [("GET", "/home/"), ("GET", "/hoge/list.html"), ("GET", "/hoge/NewEntry/")])
         self.assertEqual(status.call_args.args[3], "DONE")
 
+    async def test_created_blog_url_survives_publication_error_or_stop(self):
+        origin = "http://portal.test"
+        login = origin + "/login/"
+        home = origin + "/home/"
+        make = origin + "/home/blog/make"
+        public_url = "https://new.example.test/"
+        documents = {
+            "/login/": """<input name=email><input id=password>
+                <input type=image alt="ログイン" onclick="location.href='/home/'">""",
+            "/home/": '<a href="/hoge/list.html">My blog</a>',
+            "/home/blog/make": """<input id=name><input id=account>
+                <select id=domain><option value=7>.example.test</option></select>""",
+            "/hoge/list.html": f"""<a href="https://new.older.test/">HTTPSで表示</a>
+                <a href="{public_url}">HTTPSで表示</a>
+                <a href="/hoge/NewEntry/">ブログを書く</a>""",
+            "/hoge/NewEntry/": """<input name=title><textarea name=body></textarea>
+                <button onclick="document.querySelector('p').hidden=false">公開する</button>
+                <p class="error" hidden>入力エラー</p>""",
+        }
+
+        async def portal(route):
+            await route.fulfill(content_type="text/html; charset=utf-8", body=documents[urlsplit(route.request.url).path])
+
+        config = SimpleNamespace(blog_name="My blog", subdomain="new", shared_password="test",
+                                 html_mode=1, shared_title="Title", shared_html="<p>body</p>")
+        for stop, expected_status in ((False, "LỖI:"), (True, "ĐÃ HỦY")):
+            with self.subTest(stop=stop):
+                context = await self.browser.new_context()
+                self.addAsyncCleanup(context.close)
+                await context.route(origin + "/**", portal)
+                events = []
+
+                def on_status(idx, email, domain, status, url):
+                    events.append((status, url))
+                    if stop and status == "Đang đăng bài HTML...":
+                        runner.request_stop()
+
+                runner = NinjaAutomationRunner(config, Mock(), on_status, Mock())
+                runner._human_delay = AsyncMock()
+                runner._watch_hiragana = AsyncMock()
+                runner._process_hiragana_step = AsyncMock(return_value=True)
+                browser = SimpleNamespace(new_context=AsyncMock(return_value=context))
+                with (
+                    patch.dict(SELECTORS, login_url=login, home_url=home, make_url=make),
+                    patch("ninja_worker.login_home_stalled", return_value=False),
+                    patch("ninja_worker.random.uniform", return_value=0),
+                    patch("ninja_worker.Page.wait_for_timeout"),
+                ):
+                    await runner._process_account(browser, asyncio.Semaphore(1), 1, "user@example.test")
+
+                self.assertIn(("Đang tải trình soạn thảo (chờ 5s)...", public_url), events)
+                self.assertTrue(events[-1][0].startswith(expected_status), events)
+                self.assertEqual(events[-1][1], public_url)
+
     async def test_make_result_on_original_url(self):
         make = SELECTORS["make_url"]
         await self.page.route(make, lambda route: route.fulfill(content_type="text/html", body="<form></form>"))

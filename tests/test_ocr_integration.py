@@ -593,6 +593,46 @@ class TestOCRHiraganaIntegration(unittest.TestCase):
         self.assertEqual(fut.result(), "かきくけこさ")
         self.assertEqual(client.state_store.next_cursor, 15)
 
+    def test_ensure_ocr_server_running_launches_silently_without_console(self):
+        """ensure_ocr_server_running phải chuyển hướng stdio và không gộp DETACHED_PROCESS."""
+        import subprocess
+        from unittest.mock import Mock
+        from ocr_client import ensure_ocr_server_running
+
+        fake_ocr_dir = self.test_dir / "ocr"
+        fake_ocr_dir.mkdir(parents=True, exist_ok=True)
+        (fake_ocr_dir / "server.py").write_text("", encoding="utf-8")
+        scripts_dir = self.test_dir / ".venv" / "Scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "python.exe").write_text("", encoding="utf-8")
+        (scripts_dir / "pythonw.exe").write_text("", encoding="utf-8")
+
+        health_calls = 0
+
+        def urlopen_side_effect(req, timeout=None):
+            nonlocal health_calls
+            health_calls += 1
+            if health_calls == 1:
+                raise urllib.error.URLError("offline")
+            return MockHTTPResponse({"status": "ok"})
+
+        with patch("ocr_client.__file__", str(self.test_dir / "ocr_client.py")), \
+             patch("urllib.request.urlopen", side_effect=urlopen_side_effect), \
+             patch("subprocess.run", return_value=Mock(returncode=0)), \
+             patch("subprocess.Popen") as popen_mock, \
+             patch("time.sleep"):
+            ok, _msg = ensure_ocr_server_running(base_url="http://127.0.0.1:8000", timeout=2.0)
+
+        self.assertTrue(ok)
+        popen_mock.assert_called_once()
+        kwargs = popen_mock.call_args.kwargs
+        cmd = popen_mock.call_args.args[0]
+        self.assertEqual(Path(cmd[0]).name.lower(), "pythonw.exe")
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIsNotNone(kwargs["stdout"])
+        self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
+        self.assertEqual(kwargs["creationflags"], getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
 
 if __name__ == "__main__":
     unittest.main()

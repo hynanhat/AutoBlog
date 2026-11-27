@@ -105,6 +105,21 @@ python app.py
 
 ---
 
+## Đăng nhập Gmail trong AutoBlog
+
+Tab **Đăng ký tài khoản** hỗ trợ 2 cách kết nối hộp thư Gmail:
+
+1. **App Password (16 ký tự — không cần Google Cloud):** Chọn **App Password (16 ký tự)**, nhập Gmail nhận thư xác nhận, bấm **Lấy App Password** để tạo mã 16 ký tự trong Google Account (yêu cầu tài khoản đã bật xác minh 2 bước), dán vào ô mật khẩu ứng dụng rồi bấm **Kết nối**.
+2. **Đăng nhập Google (OAuth):** Chọn **Đăng nhập Google**, nhập Gmail rồi bấm **Đăng nhập**. Trình duyệt mở trang Google để bạn nhập mật khẩu, xác minh OTP nếu được hỏi và cấp quyền truy cập Gmail.
+
+Ở cả hai cách, AutoBlog hiện **`Đã kết nối`** khi mở được hộp thư `INBOX`. Quyền đăng nhập chỉ giữ trong bộ nhớ đến khi đóng ứng dụng.
+
+### Thiết lập Google lần đầu (chỉ dùng nếu chọn cách Đăng nhập Google OAuth)
+
+1. Chọn dự án của bạn trong Google Cloud, bật Gmail API rồi mở **Google Auth Platform**. Với Gmail cá nhân, chọn **External**. Nếu ứng dụng ở chế độ **Testing**, thêm Gmail sẽ sử dụng vào **Audience → Test users**. [Cấu hình quyền truy cập](https://developers.google.com/workspace/guides/configure-oauth-consent)
+2. Trong **Data Access**, thêm quyền IMAP `https://mail.google.com/`. Trong **Clients**, chọn **Create client → Desktop app** rồi tải JSON. [Tạo OAuth client](https://console.cloud.google.com/auth/clients)
+3. Trong AutoBlog, bấm **Đăng nhập → Chọn tệp JSON**. AutoBlog lưu cấu hình ứng dụng vào `%LOCALAPPDATA%\AutoBlog\gmail_oauth_client.json` và mở Google ngay. Nếu cài AutoBlog cho nhiều người, có thể đặt tệp Desktop của ứng dụng cạnh `run.bat` với tên `gmail_oauth_client.json`. Khi đã có cấu hình, người dùng chỉ cần nhập Gmail và bấm **Đăng nhập**.
+
 ## 🛠️ Luồng hoạt động của tính năng OCR Hiragana
 
 ```
@@ -125,6 +140,8 @@ python app.py
 3. **Nhận dạng bằng AI:** `ocr/server.py` tiếp nhận tệp, tiền xử lý qua OpenCV, gọi Gemini API nhận dạng và chuẩn hóa ký tự sang đúng 6 chữ Hiragana.
 4. **Trả kết quả:** Client đọc kết quả qua API `/results`, xác thực độ dài, và tự động điền vào ô xác thực trên trang đăng ký Shinobi.
 5. **Fallback an toàn:** Nếu OCR không nhận diện được hoặc dịch vụ tắt, ứng dụng tự động hiển thị nút xác nhận trên UI và đợi người dùng nhập tay.
+
+Bật **Dọn ảnh Hiragana khi thoát (cả hai tab)** trong mục **Xác thực Hiragana** để xóa ảnh AutoBlog đã chụp và ảnh OCR đã xử lý trong các thư mục mặc định. Ảnh đang chờ xử lý và lịch sử OCR được giữ lại.
 
 ---
 

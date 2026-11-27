@@ -1,6 +1,8 @@
 # Desktop app
 customtkinter>=5.2.0
 playwright>=1.45.0
+IMAPClient>=3.1,<4
+google-auth-oauthlib>=1.2,<2
 
 # Local OCR server
 google-genai>=1.50,<3

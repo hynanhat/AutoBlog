@@ -1,20 +1,31 @@
 import codecs
+from dataclasses import dataclass
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 BLOG_HEADER_REGEX = re.compile(r"^===\s*\[BLOG\s+(\d+)\]\s*===\s*$")
 
 
-def parse_gmails(raw_text: str, max_count: int = 101) -> Tuple[List[str], List[str]]:
+@dataclass(frozen=True)
+class GmailLine:
+    """Một địa chỉ Gmail hợp lệ cùng số dòng nguồn trong ô nhập."""
+
+    line_no: int
+    email: str
+
+
+def _parse_gmail_lines(
+    raw_text: str, max_count: Optional[int] = 101
+) -> Tuple[List[GmailLine], List[str]]:
     """
-    Phân tích danh sách Gmail dán từ giao diện:
+    Phân tích danh sách Gmail:
     - Loại bỏ dòng trống, khoảng trắng thừa
-    - Loại bỏ trùng lặp nhưng giữ nguyên thứ tự
-    - Kiểm tra định dạng email và giới hạn tối đa 101 tài khoản
+    - Loại bỏ trùng lặp (không phân biệt hoa/thường) nhưng giữ nguyên thứ tự và số dòng nguồn
+    - Kiểm tra định dạng email và giới hạn tối đa (nếu có)
     """
-    valid_gmails: List[str] = []
+    valid_entries: List[GmailLine] = []
     errors: List[str] = []
     seen = set()
 
@@ -29,14 +40,93 @@ def parse_gmails(raw_text: str, max_count: int = 101) -> Tuple[List[str], List[s
         if lowered in seen:
             continue
         seen.add(lowered)
-        valid_gmails.append(email)
+        valid_entries.append(GmailLine(line_no=line_no, email=email))
 
-    if len(valid_gmails) > max_count:
+    if max_count is not None and len(valid_entries) > max_count:
         errors.append(
-            f"Số lượng Gmail ({len(valid_gmails)}) vượt quá giới hạn tối đa {max_count} tài khoản."
+            f"Số lượng Gmail ({len(valid_entries)}) vượt quá giới hạn tối đa {max_count} tài khoản."
         )
 
-    return valid_gmails, errors
+    return valid_entries, errors
+
+
+def parse_gmails(raw_text: str, max_count: int = 101) -> Tuple[List[str], List[str]]:
+    """
+    Phân tích danh sách Gmail dán từ giao diện:
+    - Loại bỏ dòng trống, khoảng trắng thừa
+    - Loại bỏ trùng lặp nhưng giữ nguyên thứ tự
+    - Kiểm tra định dạng email và giới hạn tối đa 101 tài khoản
+    """
+    entries, errors = _parse_gmail_lines(raw_text, max_count=max_count)
+    return [entry.email for entry in entries], errors
+
+
+def _has_invalid_local_dots(email: str) -> bool:
+    local, _, _domain = email.partition("@")
+    return local.startswith(".") or local.endswith(".") or ".." in local
+
+
+def normalize_gmail_for_ownership(email: str) -> str:
+    """
+    Chuẩn hóa địa chỉ khi kiểm tra quyền sở hữu hộp thư Gmail gốc:
+    chỉ bỏ dấu chấm ở phần tên với gmail.com, không dùng để gửi hay ghép thư.
+    """
+    cleaned = email.strip()
+    local, sep, domain = cleaned.partition("@")
+    if not sep:
+        return cleaned.lower()
+    domain_lower = domain.lower()
+    if domain_lower == "gmail.com":
+        local_norm = local.replace(".", "").lower()
+    else:
+        local_norm = local.lower()
+    return f"{local_norm}@{domain_lower}"
+
+
+def belongs_to_root_gmail(email: str, root_gmail: str) -> bool:
+    """Kiểm tra email đăng ký có thuộc hộp thư Gmail gốc hay không."""
+    candidate = email.strip()
+    root = root_gmail.strip()
+    if not EMAIL_REGEX.match(candidate) or not EMAIL_REGEX.match(root):
+        return False
+    return normalize_gmail_for_ownership(candidate) == normalize_gmail_for_ownership(root)
+
+
+def parse_registration_gmails(
+    raw_text: str, root_gmail: str, max_count: int = 101
+) -> Tuple[List[GmailLine], List[str]]:
+    """
+    Phân tích danh sách Gmail cho tab Đăng ký tài khoản:
+    - Tái sử dụng quy tắc bỏ dòng trống, bỏ trùng, giữ thứ tự của parse_gmails()
+    - Giữ nguyên dấu chấm gốc và số dòng nguồn của từng địa chỉ
+    - Kiểm tra mỗi địa chỉ có thuộc hộp thư Gmail gốc (chỉ bỏ dấu chấm khi đối chiếu gmail.com)
+    """
+    root_clean = (root_gmail or "").strip()
+    if not root_clean or not EMAIL_REGEX.match(root_clean) or _has_invalid_local_dots(root_clean):
+        return [], ["Gmail gốc không đúng định dạng email."]
+
+    entries, errors = _parse_gmail_lines(raw_text, max_count=None)
+    accepted: List[GmailLine] = []
+
+    for entry in entries:
+        if _has_invalid_local_dots(entry.email):
+            errors.append(
+                f"Dòng {entry.line_no}: '{entry.email}' có dấu chấm không hợp lệ trong tên email."
+            )
+            continue
+        if not belongs_to_root_gmail(entry.email, root_clean):
+            errors.append(
+                f"Dòng {entry.line_no}: '{entry.email}' không thuộc hộp thư Gmail gốc ({root_clean})."
+            )
+            continue
+        accepted.append(entry)
+
+    if len(accepted) > max_count:
+        errors.append(
+            f"Số lượng Gmail ({len(accepted)}) vượt quá giới hạn tối đa {max_count} tài khoản."
+        )
+
+    return accepted, errors
 
 
 def parse_posts_txt(file_path: str) -> Tuple[Dict[int, Dict[str, str]], List[str]]:

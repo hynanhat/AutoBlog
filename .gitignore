@@ -18,6 +18,8 @@ env/
 !.env.example
 api_keys.txt
 .key_usage.json
+gmail_oauth_client.json
+client_secret_*.apps.googleusercontent.com.json
 
 # User Data & Account Credentials
 *.csv
@@ -29,6 +31,7 @@ logs/
 *.log
 hiragana/
 ocr_cursor.json
+ocr_cursor_register.json
 *.tmp
 *.part
 

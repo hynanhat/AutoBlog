@@ -295,6 +295,7 @@ class NinjaAutomationRunner:
             context = None
             page: Page | None = None
             selected_domain = "-"
+            blog_url = ""
             hiragana_watcher = None
 
             try:
@@ -385,32 +386,37 @@ class NinjaAutomationRunner:
                 if expected_blog_host is None:
                     await self._human_delay(page)
                 try:
-                    page = await self._open_created_blog_dashboard(context, page, idx)
-                    if expected_blog_host and not self._stop_requested:
-                        await self._verify_dashboard_host(page, expected_blog_host)
+                    dashboard = await self._open_created_blog_dashboard(context, page, idx)
+                    if dashboard is not None and (expected_blog_host is None or not self._stop_requested):
+                        page = dashboard
+                        if expected_blog_host:
+                            await self._verify_dashboard_host(page, expected_blog_host)
+                        blog_url = await self._extract_blog_url(page, selected_domain, domain_label)
                 except PlaywrightTimeoutError as exc:
                     raise NeedsManualReview("Hết thời gian chờ mở trang quản trị. Phiên chưa đến bước soạn bài.") from exc
 
                 if self._stop_requested:
-                    self.on_status(idx, email, selected_domain, "ĐÃ HỦY", "")
+                    self.on_status(idx, email, selected_domain, "ĐÃ HỦY", blog_url)
                     return
 
                 # BƯỚC 3: Soạn thảo HTML Source & Xuất bản
-                self.on_status(idx, email, selected_domain, "Đang tải trình soạn thảo (chờ 5s)...", "")
+                self.on_status(idx, email, selected_domain, "Đang tải trình soạn thảo (chờ 5s)...", blog_url)
                 await self._human_delay(page)
                 write_btn = page.locator(SELECTORS["write_blog_link"]).first
                 await write_btn.wait_for(state="visible", timeout=20000)
                 await write_btn.click()
                 await page.wait_for_load_state("domcontentloaded", timeout=20000)
+                if not blog_url:
+                    blog_url = await self._extract_blog_url(page, selected_domain, domain_label)
 
                 # Delay 5 giây để trang /hoge/NewEntry/ tải xong hoàn toàn trình soạn thảo HTML
                 await page.wait_for_timeout(5000)
 
                 if self._stop_requested:
-                    self.on_status(idx, email, selected_domain, "ĐÃ HỦY", "")
+                    self.on_status(idx, email, selected_domain, "ĐÃ HỦY", blog_url)
                     return
 
-                self.on_status(idx, email, selected_domain, "Đang đăng bài HTML...", "")
+                self.on_status(idx, email, selected_domain, "Đang đăng bài HTML...", blog_url)
                 post_title, post_html = self._get_post_payload(idx)
                 await page.locator(SELECTORS["post_title"]).first.fill(post_title)
                 await self._human_delay(page)
@@ -427,7 +433,7 @@ class NinjaAutomationRunner:
                 await self._human_delay(page)
 
                 if self._stop_requested:
-                    self.on_status(idx, email, selected_domain, "ĐÃ HỦY", "")
+                    self.on_status(idx, email, selected_domain, "ĐÃ HỦY", blog_url)
                     return
 
                 try:
@@ -438,7 +444,8 @@ class NinjaAutomationRunner:
                 else:
                     status = "DONE"
                     detail = "Đã nhận xác nhận xuất bản."
-                blog_url = await self._extract_blog_url(page, selected_domain)
+                if not blog_url:
+                    blog_url = await self._extract_blog_url(page, selected_domain, domain_label)
                 if status == PUBLICATION_UNCONFIRMED and await public_post_matches(browser, blog_url, post_title, post_html):
                     status = PUBLIC_POST_FOUND
                     detail = f"Đã đối chiếu tiêu đề và nội dung trên blog công khai: {post_title}."
@@ -450,12 +457,12 @@ class NinjaAutomationRunner:
                     hiragana_watcher.cancel()
                     await asyncio.gather(hiragana_watcher, return_exceptions=True)
                 self.on_log(f"[{idx}] {exc}")
-                self.on_status(idx, email, selected_domain, "Chờ kiểm tra trên Chromium", "")
+                self.on_status(idx, email, selected_domain, "Chờ kiểm tra trên Chromium", blog_url)
                 await self._review_tabs(context, idx)
                 status = "ĐÃ HỦY" if self._stop_requested else f"LỖI: {exc}"
-                self.on_status(idx, email, selected_domain, status, "")
+                self.on_status(idx, email, selected_domain, status, blog_url)
             except Exception as exc:
-                self.on_status(idx, email, selected_domain, f"LỖI: {exc}", "")
+                self.on_status(idx, email, selected_domain, f"LỖI: {exc}", blog_url)
                 self.on_log(f"[{idx}] Lỗi ({email}): {exc}")
             finally:
                 if hiragana_watcher is not None and not hiragana_watcher.done():
@@ -570,7 +577,7 @@ class NinjaAutomationRunner:
                 # Only a fresh copy of the form indicates a reset. The old page may
                 # clear or disable its field while an accepted POST is still pending.
                 if form_time_origin is not None and await field.is_visible() and await field.evaluate(
-                    "(input, origin) => (performance.timeOrigin !== origin && !input.disabled) || (!input.disabled && !input.value.trim())",
+                    "(input, origin) => performance.timeOrigin !== origin && !input.disabled",
                     form_time_origin,
                 ):
                     return False
@@ -770,7 +777,7 @@ class NinjaAutomationRunner:
                 break
             await asyncio.sleep(min(0.25, remaining))
 
-    async def _open_created_blog_dashboard(self, context, page: Page, idx: int) -> Page:
+    async def _open_created_blog_dashboard(self, context, page: Page, idx: int) -> Page | None:
         if "/hoge/" in page.url:
             return page
 
@@ -797,7 +804,7 @@ class NinjaAutomationRunner:
                     raise NeedsManualReview("Shinobi đã chuyển khỏi trang tổng quan sau khi tải lại.")
                 await ready.wait_for(state="visible", timeout=OVERVIEW_TIMEOUT_MS)
         if self._stop_requested:
-            return page
+            return None
         if await direct_link.is_visible():
             await direct_link.click()
         else:
@@ -856,12 +863,15 @@ class NinjaAutomationRunner:
         title = item["title"] if item["title"] else self.config.shared_title
         return title, item["html"]
 
-    async def _extract_blog_url(self, page: Page, selected_domain: str) -> str:
+    async def _extract_blog_url(self, page: Page, selected_domain: str, domain_label: str) -> str:
         subdomain = self.config.subdomain.lower()
         domain = selected_domain.lower().lstrip(".")
-        if re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
+        domain_pattern = r"[a-z0-9-]+(?:\.[a-z0-9-]+)+"
+        if re.fullmatch(domain_pattern, domain):
             return f"https://{subdomain}.{domain}/"
-        # Some domain options have a numeric value. Use the public link in the editor.
+        # Numeric option values need the public link from the dashboard or editor.
+        label_domain = re.split(r"[\s(（]", domain_label, maxsplit=1)[0].lower().lstrip(".")
+        expected_host = f"{subdomain}.{label_domain}" if re.fullmatch(domain_pattern, label_domain) else None
         try:
             links = await page.locator(SELECTORS["blog_url_link"] + ", a:has-text('ブログを見る'), a:has-text('公開ページ')").evaluate_all(
                 "(links) => links.map(a => a.href)"
@@ -871,7 +881,9 @@ class NinjaAutomationRunner:
         for href in links:
             try:
                 url = urlsplit(href)
-                if url.scheme in ("https", "http") and (url.hostname or "").startswith(subdomain + "."):
+                host = url.hostname or ""
+                host_matches = host == expected_host if expected_host else host.startswith(subdomain + ".")
+                if url.scheme in ("https", "http") and host_matches:
                     return href
             except ValueError:
                 continue

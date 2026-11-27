@@ -8,6 +8,8 @@ RUNTIME_MODULES = (
     "customtkinter",
     "playwright.async_api",
     "playwright.sync_api",
+    "imapclient",
+    "google_auth_oauthlib.flow",
     "google.genai",
     "cv2",
     "numpy",
